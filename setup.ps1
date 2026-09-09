@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.6.2 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.6.3 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -10,6 +10,9 @@
 #                      并自动清理上次中断残留、占用 3306 的其它便携 mysqld 实例
 #                v2.6.2: 修复 root 空密码时 init_db.py/db_init.py 报 "expected one argument"
 #                      (PS5.1 丢弃空字符串参数) -> 改传 "--password=<值>" 单 token; 简化便携实例密码询问
+#                v2.6.3: 缺 deepseek-harness 源码/依赖时, 3/6 与菜单 [F]/[D] 自动联网获取
+#                      (git 浅克隆或官方 zip) 并 pnpm install, 不再报错要求手动装;
+#                      ROOT 定位兼容两种启动方式(-File 与 scriptblock), 避免 Path 为空崩溃
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -49,7 +52,13 @@ $ErrorActionPreference = "Stop"
 # 本脚本大量调用原生命令并以 $LASTEXITCODE 判断成败:
 # 关闭 PS7.3+ "原生 stderr → 终止错误" 的默认行为, 避免告警类 stderr 误伤主流程
 $PSNativeCommandUseErrorActionPreference = $false
-$ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 包根目录: 兼容两种启动方式
+#   a) powershell -File setup.ps1  (setup.bat v2.6.3+): $MyInvocation 有脚本路径
+#   b) scriptblock 动态加载运行: 路径为 null, 兜底取当前目录(setup.bat 启动前已 cd /d 到包根)
+$ROOT = $null
+if ($MyInvocation.MyCommand.Path) { $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $ROOT -and $PSScriptRoot) { $ROOT = $PSScriptRoot }
+if (-not $ROOT) { $ROOT = (Get-Location).Path }
 # -Product = 无人值守产品模式: 自动补环境/MySQL, 装配完整后直接启动门户并开浏览器
 if ($Product) { $AutoInstall = $true; $AutoMySQLZip = $true; $SkipDB = $false; $SkipPortal = $false }
 $VENV = Join-Path $ROOT "bi_workbench\.venv"
