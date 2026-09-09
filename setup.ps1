@@ -480,20 +480,29 @@ elseif (Test-BiDbReady) {
     Warn "如需重置演示数据: 手动执行 init_db.py / db_init.py (需 root 密码), 或删库后重跑本脚本"
 }
 else {
+    # ---- 确定 root 密码(可为空): 便携 MySQL 默认空; 系统实例/显式参数直接采用 ----
     if (-not $PSBoundParameters.ContainsKey('MySQLRootPassword') -and $AutoMySQLZip -and $mysqlUp) {
-        # 便携实例(root 空密码)但用户未显式给密码 -> 询问是否为空
-        if ($MySQLRootPassword -eq "" ) {
-            $ans = Read-Host "  检测到便携 MySQL(root 空密码)。直接回车=root密码为空; 输入'#'=改用其他密码"
-            if ($ans -ne "" -and $ans -ne "#") { $MySQLRootPassword = $ans }
+        $ans = Read-Host "  检测到便携 MySQL(root 空密码)。直接回车=root密码为空; 输入'#'=改用其他密码"
+        if ($ans -eq "#") {
+            $MySQLRootPassword = Read-Host "  请输入 MySQL root 密码"
         }
+        elseif ($ans -ne "") {
+            $MySQLRootPassword = $ans
+        }
+        # 直接回车 => 保持空(root 无密码), 不再二次询问
     }
-    if (-not $MySQLRootPassword) {
+    elseif (-not $MySQLRootPassword) {
         $MySQLRootPassword = Read-Host "  请输入 MySQL root 密码(便携实例直接回车)"
     }
-    & $PY (Join-Path $ROOT "bi_workbench\scripts\init_db.py") --password $MySQLRootPassword
+    if (-not $MySQLRootPassword) { Ok "root 密码为空(便携实例), 直接以空密码初始化" }
+
+    # 注意: 密码可能为空, 必须用 --password=<值> 单 token 传参:
+    # PowerShell 5.1 向原生命令传裸空字符串参数时会被丢弃,
+    # 导致 argparse 收到无值的 --password 而报 "expected one argument"
+    & $PY (Join-Path $ROOT "bi_workbench\scripts\init_db.py") "--password=$MySQLRootPassword"
     if ($LASTEXITCODE -ne 0) { Err "bi_workbench 初始化失败(MySQL 是否已启动? 密码是否正确?)"; exit 1 }
     Ok "bi_workbench 库已建 + 造数完成"
-    & $PY (Join-Path $ROOT "hr_backend\db_init.py") --password $MySQLRootPassword
+    & $PY (Join-Path $ROOT "hr_backend\db_init.py") "--password=$MySQLRootPassword"
     if ($LASTEXITCODE -ne 0) { Err "hr_bi 初始化失败"; exit 1 }
     Ok "hr_bi 库已建 + 造数完成"
 }
