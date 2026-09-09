@@ -302,6 +302,70 @@ function Start-DshPortal {
     }
 }
 
+# 确保 dsh 门户运行时(deepseek-harness)就绪: 缺源码时按需联网获取(git 浅克隆或官方 zip),
+# 缺 node_modules 时自动 pnpm install。该引擎是第三方上游工程(源码数百 MB + 依赖≈1.5GB),
+# 为控制仓库体积未内置; 等价宿主/评测不需要它。
+# -FetchIfMissing: 交互(默认 setup.bat 菜单)不主动拉取; -Product 无人值守与菜单选 F/D 时自动/确认后拉取。
+function Invoke-HarnessBootstrap {
+    param([switch]$FetchIfMissing)
+    $h = Join-Path $ROOT "deepseek-harness"
+    $hasSrc = Test-Path (Join-Path $h "package.json")
+    $hasMod = Test-Path (Join-Path $h "node_modules")
+    if ($hasSrc -and $hasMod) { Ok "deepseek-harness 依赖已就绪(node_modules 存在), 跳过安装"; return $true }
+    if ($hasSrc -and -not $hasMod) {
+        Warn "deepseek-harness 缺少 node_modules, 开始自动安装门户依赖(需联网, 下载约 1.5GB, 可能 10-20 分钟) ..."
+    } else {
+        # 源码缺失 -> 询问/自动获取
+        if (-not $FetchIfMissing) {
+            Warn "未找到 deepseek-harness 源码(等价宿主/评测无需)。选 [F]/[D] 启动门户时会自动联网获取; -Product 模式全程自动"
+            return $false
+        }
+        if (-not $Product) {
+            if ([Console]::IsInputRedirected) { Warn "非交互终端且未启用 -Product, 跳过自动获取门户运行时"; return $false }
+            $ans = (Read-Host "  将联网获取 dsh 门户运行时 deepseek-harness(官方上游, 源码+依赖约 1-2GB, 需 10-20 分钟)。继续? [Y/n]").Trim()
+            if ($ans -ne "" -and $ans -ne "Y" -and $ans -ne "y") { Warn "已跳过, 等价宿主/评测仍可用"; return $false }
+        }
+        $repoBase = if ($env:HARNESS_REPO) { $env:HARNESS_REPO.TrimEnd('.git','/') } else { "https://github.com/deepseek-ai/deepseek-harness" }
+        $branch   = if ($env:HARNESS_BRANCH) { $env:HARNESS_BRANCH } else { "master" }
+        $git = (Get-Command git -ErrorAction SilentlyContinue).Source
+        if ($git) {
+            Warn "自动克隆 deepseek-harness($branch, 浅克隆, 联网下载源码)..."
+            & $git clone --depth 1 --branch $branch "$repoBase.git" $h 2>&1 | Out-Null
+        } else {
+            Warn "未检测到 git, 改为直接下载官方 zip 并解压..."
+            $zip = Join-Path $RUNTIME "deepseek-harness.zip"
+            $tmp = Join-Path $RUNTIME "harness-unzip"
+            try {
+                Invoke-WebRequest -Uri "$repoBase/archive/refs/heads/$branch.zip" -OutFile $zip -UseBasicParsing
+                if ((Get-Item $zip).Length -lt 100KB) { throw "下载被拦截或文件异常(大小过小)" }
+                if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+                Expand-Archive -Path $zip -DestinationPath $tmp
+                $dir = Get-ChildItem -Path $tmp -Directory -Filter "deepseek-harness*" | Select-Object -First 1
+                if (-not $dir) { throw "zip 解压后未找到 deepseek-harness 目录" }
+                if (Test-Path $h) { Remove-Item $h -Recurse -Force }
+                Move-Item $dir.FullName $h
+            } catch { Err "自动获取 deepseek-harness 失败: $($_.Exception.Message)"; return $false }
+        }
+        if (-not (Test-Path (Join-Path $h "package.json"))) { Err "获取 deepseek-harness 失败, 请检查网络后重试(或手动放置该目录)"; return $false }
+        Ok "deepseek-harness 源码已就绪($h)"
+    }
+    # 依赖安装
+    $nodeExe = Ensure-NodeRuntime
+    if (-not $nodeExe) { Warn "未检测到 node, 自动下载便携版(约 36MB)..."; $nodeExe = Install-PortableNode }
+    if (-not $nodeExe) { Err "node 获取失败, 无法安装门户依赖"; return $false }
+    $pnpm = Ensure-Pnpm $nodeExe
+    if (-not $pnpm) { Err "pnpm 安装失败, 请手动执行 npm install -g pnpm 后重跑"; return $false }
+    Ok "node $(& $nodeExe --version 2>$null) / pnpm $(& $pnpm --version 2>$null)"
+    Push-Location $h
+    try {
+        Warn "执行 pnpm install (联网拉取依赖) ..."
+        & $pnpm install --no-frozen-lockfile
+        if ($LASTEXITCODE -ne 0) { Err "pnpm install 失败(见上方输出)。可重跑本脚本或手动: cd '$h' ; pnpm install"; return $false }
+    } finally { Pop-Location }
+    Ok "deepseek-harness 依赖安装完成。选 [F] 即可一键启动门户并自动打开浏览器"
+    return $true
+}
+
 # ------------------------------------------------------------ 0. 体检
 Write-Host "平台化企业智能问数工作台 - 一键配置" -ForegroundColor Magenta
 Write-Host "仓库根: $ROOT"
@@ -568,49 +632,10 @@ else {
         } else { Ok "门户插件依赖已就绪 (~/.dsh/profiles/web)" }
     }
 
-    # ---- deepseek-harness 依赖自举 (有源码但缺 node_modules 时自动安装) ----
-    $harness = Join-Path $ROOT "deepseek-harness"
-    $hasSrc = Test-Path (Join-Path $harness "package.json")
-    $hasMod = Test-Path (Join-Path $harness "node_modules")
-    if (-not $hasSrc) {
-        Warn "未找到 deepseek-harness 源码(等价宿主/评测无需; 若要 dsh 门户, 请把'门户增强包'解压覆盖到本目录后重跑)"
-    } elseif ($hasMod) {
-        Ok "deepseek-harness 依赖已就绪(node_modules 存在), 跳过安装"
-    } else {
-        Warn "deepseek-harness 缺少 node_modules, 开始自动安装门户依赖(需联网, 下载约 1.5GB, 可能 10-20 分钟; 可用 -SkipPortal 跳过) ..."
-        # --- 定位/安装 node (优先便携 zip 直下, 无需管理员/winget) ---
-        $nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source
-        if (-not $nodeExe) {
-            $c = Join-Path $env:LOCALAPPDATA "Programs\nodejs\node.exe"
-            if (Test-Path $c) { $nodeExe = $c }
-        }
-        if (-not $nodeExe) { $nodeExe = Find-PortableNode }
-        if (-not $nodeExe -and $AutoInstall) {
-            Warn "未检测到 node, 自动下载官方 Node $NODE_VERSION 便携包到 .runtime (约 36MB)..."
-            $nodeExe = Install-PortableNode
-        }
-        if (-not $nodeExe) {
-            Warn "未检测到 node, 且未启用自动下载(重跑加 -AutoInstall)或下载失败。跳过门户依赖, 等价宿主仍可用"
-        } else {
-            Ok "node $(& $nodeExe --version 2>$null)"
-            # --- 定位/安装 pnpm (node 自带 npm, 用 npm -g 装 pnpm) ---
-            $pnpm = Ensure-Pnpm $nodeExe
-            if (-not $pnpm) {
-                Warn "pnpm 安装失败, 请手动执行 npm install -g pnpm 后重跑本脚本"
-            } else {
-                Ok "pnpm $(& $pnpm --version 2>$null)"
-                Push-Location $harness
-                try {
-                    Warn "执行 pnpm install (联网拉取依赖) ..."
-                    & $pnpm install --no-frozen-lockfile
-                    if ($LASTEXITCODE -eq 0) {
-                        Ok "deepseek-harness 依赖安装完成。回到第 5 步选 [F] 可一键启动门户并自动打开浏览器(或 setup.bat -Product)"
-                    } else {
-                        Warn "pnpm install 失败(见上方输出)。可重跑本脚本, 或在 deepseek-harness 内手动执行 pnpm install"
-                    }
-                } finally { Pop-Location }
-            }
-        }
+    # ---- deepseek-harness 运行时自举(缺源码按需获取; 缺 node_modules 自动安装) ----
+    # -Product 无人值守自动获取; 普通交互仅提示, 菜单选 [F]/[D] 时再确认获取
+    if (-not (Invoke-HarnessBootstrap -FetchIfMissing:$Product)) {
+        Warn "deepseek-harness 未就绪: 当前可用等价宿主/评测(无需门户); 启动门户请稍后选 [F] 或重跑 setup.bat -Product"
     }
 }
 
@@ -652,25 +677,21 @@ switch ($choice) {
         & $PY (Join-Path $ROOT "eval\runner.py")
     }
     "D" {
-        $h = Join-Path $ROOT "deepseek-harness"
-        if (-not (Test-Path (Join-Path $h "package.json"))) {
-            Warn "未找到 deepseek-harness 源码(门户运行时), 无法启动门户"
-        } elseif (-not (Test-Path (Join-Path $h "node_modules"))) {
-            Warn "deepseek-harness 依赖未安装。请重跑本脚本(3/6 会自动 pnpm install), 或手动: cd '$h' ; pnpm i"
-        } else {
-            $nodeExe = Ensure-NodeRuntime
-            if (-not $nodeExe) { Err "node 不可用, 无法启动门户"; break }
-            $pnpm = Ensure-Pnpm $nodeExe
-            if (-not $pnpm) { Err "pnpm 不可用, 无法启动门户"; break }
-            $gen = New-DshPatch
-            if (-not $gen) { Err "未找到 dsh-cordis.patch.yml 模板"; break }
-            Ok "前台启动 dsh 图形门户(首次较慢, Ctrl+C 退出)..."
-            Push-Location $h
-            try { & $pnpm dsh web --patch $gen }
-            finally { Pop-Location }
-        }
+        if (-not (Invoke-HarnessBootstrap -FetchIfMissing)) { Err "门户运行时未就绪, 未能启动"; break }
+        $nodeExe = Ensure-NodeRuntime
+        if (-not $nodeExe) { Err "node 不可用, 无法启动门户"; break }
+        $pnpm = Ensure-Pnpm $nodeExe
+        if (-not $pnpm) { Err "pnpm 不可用, 无法启动门户"; break }
+        $gen = New-DshPatch
+        if (-not $gen) { Err "未找到 dsh-cordis.patch.yml 模板"; break }
+        Ok "前台启动 dsh 图形门户(首次较慢, Ctrl+C 退出)..."
+        Push-Location (Join-Path $ROOT "deepseek-harness")
+        try { & $pnpm dsh web --patch $gen }
+        finally { Pop-Location }
     }
     "F" {
+        # 缺源码/依赖时先自动联网获取(官方上游)并 pnpm install, 再启动
+        if (-not (Invoke-HarnessBootstrap -FetchIfMissing)) { Err "门户运行时未就绪, 未能启动"; break }
         Start-DshPortal (Join-Path $ROOT "deepseek-harness")
     }
     default { Ok "本次不启动任何服务, 配置完成" }
