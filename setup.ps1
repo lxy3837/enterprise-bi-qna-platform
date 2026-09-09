@@ -1,0 +1,673 @@
+﻿#============================================================
+#  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
+#  版本: v2.6.1 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
+#                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
+#                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
+#                v2.6: 修复 Windows PowerShell 5.1 下 mysqld --initialize 的 stderr 日志
+#                      经 2>&1 合并后被 EAP=Stop 当成致命错误逐行中断的问题(stderr 改落盘)
+#                v2.6.1: mysqld 启动失败时把 .runtime\mysqld.err.log 尾部直接打到屏幕,
+#                      并自动清理上次中断残留、占用 3306 的其它便携 mysqld 实例
+#
+#  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
+#    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
+#    MySQL     : 探测 127.0.0.1:3306 TCP 是否可达(服务在跑即算有)
+#    Node/pnpm : 仅"dsh 图形门户"需要; 3/6 自动定位/下载便携 Node(zip)
+#                并用 npm 装 pnpm; harness 与 ~/.dsh/profiles/web 缺依赖时自动
+#                pnpm install(需联网, harness≈1.5GB, 插件层数百 MB)
+#    winget    : 仅作官网下载失败的兜底通道(非必需)
+#
+#  自动下载开关(均需联网; 版本/URL 于 2026-09 实测可达):
+#    -AutoInstall     缺 python 时下载官方 python.org 安装器静默安装;
+#                     缺 node 时下载官方 nodejs.org 便携 zip 解压到 .runtime\nodejs
+#    -AutoMySQLZip    3306 不通时, 下载 CDN 直链 MySQL 8.0 ZIP 便携版到 .runtime,
+#                     本地初始化(root 空密码)并启动, 供本机自举演示
+#    -SkipDB          跳过建库造数
+#    -SkipPortal      跳过 dsh 门户装配(配置/插件层)与依赖自举
+#    -Verify          执行 47 条评测回归(默认关闭, 避免覆盖手写报告)
+#    -ResetProfile    强制重建 ~/.dsh/profiles/web(清旧冲突依赖后在线重装插件)
+#    -Product         无人值守产品模式 = AutoInstall+AutoMySQLZip, 装配完成后
+#                     直接后台启动门户并自动打开浏览器(见第 5 步 [F])
+#
+#  产品用法: 全新机器一键 = setup.bat -Product      (全部自动, 完成后浏览器打开门户)
+#  示例(带评测): setup.bat -Product -Verify
+# ============================================================
+[CmdletBinding()]
+param(
+    [string]$MySQLRootPassword = "",
+    [switch]$AutoInstall,
+    [switch]$AutoMySQLZip,
+    [switch]$SkipDB,
+    [switch]$SkipPortal,
+    [switch]$Verify,
+    [switch]$ResetProfile,
+    [switch]$Product
+)
+$ErrorActionPreference = "Stop"
+# 本脚本大量调用原生命令并以 $LASTEXITCODE 判断成败:
+# 关闭 PS7.3+ "原生 stderr → 终止错误" 的默认行为, 避免告警类 stderr 误伤主流程
+$PSNativeCommandUseErrorActionPreference = $false
+$ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
+# -Product = 无人值守产品模式: 自动补环境/MySQL, 装配完整后直接启动门户并开浏览器
+if ($Product) { $AutoInstall = $true; $AutoMySQLZip = $true; $SkipDB = $false; $SkipPortal = $false }
+$VENV = Join-Path $ROOT "bi_workbench\.venv"
+$PY   = Join-Path $VENV "Scripts\python.exe"
+
+# ---- 自动下载版本/URL (2026-09-09 已实测可达) ----
+# Python: 官方 python.org 安装器(用户级静默安装, 装到 %LOCALAPPDATA%\Programs\Python\Python313)
+$PY_VERSION   = "3.13.15"
+$PY_EXE_NAME  = "python-$PY_VERSION-amd64.exe"
+$PY_EXE_URL   = "https://www.python.org/ftp/python/$PY_VERSION/$PY_EXE_NAME"
+# Node: 官方 nodejs.org LTS 便携 zip(解压即用, 无需管理员)
+$NODE_VERSION = "v24.21.0"
+$NODE_ZIP_NAME = "node-$NODE_VERSION-win-x64.zip"
+$NODE_ZIP_URL  = "https://nodejs.org/dist/$NODE_VERSION/$NODE_ZIP_NAME"
+# MySQL: 官方 8.0 ZIP 便携版 (注意: dev.mysql.com/get 网关常 403, 优先 CDN 直链)
+$MYSQL_ZIP_NAME = "mysql-8.0.45-winx64.zip"
+$MYSQL_ZIP_URLS = @(
+    "https://cdn.mysql.com/Downloads/MySQL-8.0/$MYSQL_ZIP_NAME",                                          # 官方 CDN
+    "https://mirrors.huaweicloud.com/mysql/Downloads/MySQL-8.0/$MYSQL_ZIP_NAME",                          # 华为云镜像
+    "https://mirrors.tuna.tsinghua.edu.cn/mysql/downloads/MySQL-8.0/$MYSQL_ZIP_NAME",                     # 清华镜像
+    "https://dev.mysql.com/get/Downloads/MySQL-8.0/$MYSQL_ZIP_NAME"                                       # 官方网关(常 403, 仅兜底)
+)
+$RUNTIME = Join-Path $ROOT ".runtime"
+
+function Step([string]$t) { Write-Host "`n===== $t =====" -ForegroundColor Cyan }
+function Ok([string]$t)   { Write-Host "  [OK] $t" -ForegroundColor Green }
+function Warn([string]$t) { Write-Host "  [!] $t" -ForegroundColor Yellow }
+function Err([string]$t)  { Write-Host "  [ERR] $t" -ForegroundColor Red }
+
+# 等一个 TCP 端口就绪(最多 n 秒)
+function Wait-Port([int]$port, [int]$timeoutSec = 30) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $timeoutSec) {
+        $c = New-Object Net.Sockets.TcpClient
+        try { $c.Connect("127.0.0.1", $port); $c.Close(); return $true }
+        catch { $c.Dispose(); Start-Sleep -Milliseconds 500 }
+    }
+    return $false
+}
+
+# 探测"双库已初始化": 用只读账号(bi_ro/hr_ro)连库并查表, 全通返回 $true。
+# 用于产品模式幂等: 已就绪则无需 root 密码重复建库造数, 一键重跑不再打断。
+# 注意: 内嵌 python 仅用单引号, 规避 pwsh 向原生命令传参时剥掉双引号的问题。
+function Test-BiDbReady {
+    if (-not (Test-Path $PY)) { return $false }
+    $code = @'
+import pymysql, sys
+def t(u, pw, db, q):
+    try:
+        c = pymysql.connect(host='127.0.0.1', port=3306, user=u, password=pw,
+                            database=db, connect_timeout=2)
+        cur = c.cursor(); cur.execute(q); cur.fetchone(); c.close(); return True
+    except Exception:
+        return False
+ok = t('bi_ro', 'bi_ro_pass_2026', 'bi_workbench', 'SELECT COUNT(*) FROM audit_log') and t('hr_ro', 'hr_ro_pass_2026', 'hr_bi', 'SELECT COUNT(*) FROM hr_audit')
+sys.exit(0 if ok else 1)
+'@
+    $old = $PSNativeCommandUseErrorActionPreference
+    $PSNativeCommandUseErrorActionPreference = $false
+    try { & $PY -c $code 2>$null } finally { $PSNativeCommandUseErrorActionPreference = $old }
+    return ($LASTEXITCODE -eq 0)
+}
+
+# ------------------------------------------------------------ 下载/运行时工具
+# 校验 ZIP 魔数(PK\x03\x04 / 空包 PK\x05\x06), 识别被网关换成 HTML 错误页的假文件
+function Test-ZipFile([string]$Path) {
+    try {
+        $fs = [IO.File]::OpenRead($Path)
+        try {
+            $b = New-Object byte[] 4
+            $null = $fs.Read($b, 0, 4)
+            return (($b[0] -eq 0x50) -and ($b[1] -eq 0x4B) -and
+                    (($b[2] -eq 0x03) -or ($b[2] -eq 0x05) -or ($b[2] -eq 0x07)))
+        } finally { $fs.Close() }
+    } catch { return $false }
+}
+
+# 下载文件(已存在则跳过; 失败自动清理残件并返回 $false)
+#  -Zip: 下载后校验 ZIP 头, 假文件(HTML 拦截页)一律判失败以便换镜像重试
+function Download-File([string]$Url, [string]$Out, [string]$Label, [switch]$Zip) {
+    if (Test-Path $Out) { Ok "$Label 已存在, 跳过下载: $Out"; return $true }
+    try {
+        Warn "下载 $Label (需联网, 稍候) ..."
+        Invoke-WebRequest -Uri $Url -OutFile $Out -UseBasicParsing -TimeoutSec 900 -UserAgent "Mozilla/5.0"
+        $len = (Get-Item $Out).Length
+        if ($len -lt 1KB) { throw "下载文件过小(疑似被网关拦截)" }
+        if ($Zip -and -not (Test-ZipFile $Out)) { throw "不是有效 ZIP(疑似下载到 HTML 拦截页), 换下一镜像重试" }
+        Ok "$Label 下载完成 ($([math]::Round($len/1MB,1)) MB)"
+        return $true
+    } catch {
+        Err "下载 $Label 失败: $($_.Exception.Message)"
+        if (Test-Path $Out) { Remove-Item $Out -Force -ErrorAction SilentlyContinue }
+        return $false
+    }
+}
+
+# 探测 .runtime\nodejs 下已解压的便携 node, 命中则把其目录加入当前进程 PATH
+function Find-PortableNode {
+    $root = Join-Path $RUNTIME "nodejs"
+    $d = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
+         Where-Object { Test-Path (Join-Path $_.FullName "node.exe") } | Select-Object -First 1
+    if ($d) { $env:PATH = "$($d.FullName);$env:PATH"; return (Join-Path $d.FullName "node.exe") }
+    return $null
+}
+
+# 下载官方 Node 便携 zip 并解压到 .runtime\nodejs, 加入 PATH; 返回 node.exe 或 $null
+function Install-PortableNode {
+    $root = Join-Path $RUNTIME "nodejs"
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    $zip = Join-Path $root $NODE_ZIP_NAME
+    if (-not (Download-File -Url $NODE_ZIP_URL -Out $zip -Label "Node.js $NODE_VERSION 便携包" -Zip)) { return $null }
+    try { Expand-Archive -Path $zip -DestinationPath $root -Force }
+    catch { Err "解压 node 便携包失败: $($_.Exception.Message)"; return $null }
+    $nodeExe = Join-Path (Join-Path $root ($NODE_ZIP_NAME -replace "\.zip$", "")) "node.exe"
+    if (-not (Test-Path $nodeExe)) { Err "便携 node 解压异常, 未找到 node.exe"; return $null }
+    $env:PATH = "$(Split-Path $nodeExe);$env:PATH"
+    Ok "便携 node 就绪: $nodeExe"
+    return $nodeExe
+}
+
+# 用已就绪 node 的 npm 全局安装 pnpm@12(幂等); 返回 pnpm 命令或 $null
+function Ensure-Pnpm([string]$NodeExe) {
+    $pnpm = (Get-Command pnpm -ErrorAction SilentlyContinue).Source
+    if ($pnpm) { return $pnpm }
+    $npmCmd = Join-Path (Split-Path $NodeExe) "npm.cmd"
+    if (-not (Test-Path $npmCmd)) { return $null }
+    Warn "未检测到 pnpm, 用 npm 安装 pnpm@12 ..."
+    & $npmCmd install -g pnpm@12 --silent | Out-Null
+    $pnpm = (Get-Command pnpm -ErrorAction SilentlyContinue).Source
+    if (-not $pnpm) {
+        $prefix = (& $npmCmd prefix -g 2>$null | Select-Object -First 1)
+        $pc = Join-Path $prefix "pnpm.cmd"
+        if (Test-Path $pc) { $pnpm = $pc }
+    }
+    return $pnpm
+}
+
+# 由 dsh-cordis.patch.yml 模板生成"当前解压根"的 MCP 补丁({{ROOT}} 占位 → 实际路径)
+function New-DshPatch {
+    $tpl = Join-Path $ROOT "dsh-cordis.patch.yml"
+    $out = Join-Path $RUNTIME "dsh-cordis.generated.yml"
+    if (-not (Test-Path $tpl)) { return $null }
+    New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
+    $rootF = $ROOT.Replace("\", "/")
+    $txt  = (Get-Content -LiteralPath $tpl -Raw).Replace("{{ROOT}}", $rootF)
+    [IO.File]::WriteAllText($out, $txt, (New-Object System.Text.UTF8Encoding($true)))
+    Ok "已生成运行时 MCP 补丁: $out"
+    return $out
+}
+
+# 定位 node: PATH → 用户级安装 → .runtime 便携; AutoInstall 时自动下载便携版
+function Ensure-NodeRuntime {
+    $ne = (Get-Command node -ErrorAction SilentlyContinue).Source
+    if (-not $ne) { $ne = Find-PortableNode }
+    if (-not $ne -and $AutoInstall) {
+        Warn "未检测到 node, 自动下载官方 Node $NODE_VERSION 便携包到 .runtime (约 36MB)..."
+        $ne = Install-PortableNode
+    }
+    return $ne
+}
+
+# 解析 dsh 门户本机地址(广告/第三方域名绝不参与匹配):
+#   1) 优先 stdout 中 "dsh web:"/"Local:" 等显式标记后的 URL;
+#   2) 其次在 out+err 里找 localhost/127.0.0.1 等回环地址;
+#   返回 $null 表示尚未就绪。注: stderr 常先出现 gofastmcp/fastmcp.cloud 横幅, 只作诊断不用于开浏览器。
+function Select-PortalUrl([string]$stdout, [string]$stderr) {
+    if ($stdout) {
+        $m = [regex]::Match($stdout, '(?:dsh web|Local|listening at|http server)[:：]*\s*(https?://[^\s"<>|]+)', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($m.Success) { return $m.Groups[1].Value.TrimEnd(')',']',',','.','|',';','；','，') }
+    }
+    $all = ($stdout + "`n" + $stderr)
+    foreach ($m in [regex]::Matches($all, 'https?://[^\s"<>|]+')) {
+        if ($m.Value -match 'https?://(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)') {
+            return $m.Value.TrimEnd(')',']',',','.','|',';','；','，')
+        }
+    }
+    return $null
+}
+
+# 后台启动 dsh web(隐藏窗口 + 日志), 轮询日志解析地址并自动打开浏览器
+function Start-DshPortal {
+    param([string]$Harness)
+    # 幂等: 上次启动的门户若仍在运行(端口可连), 直接复用并打开, 不重复起实例
+    $plog = Join-Path $RUNTIME "logs\dsh-web.out.log"
+    if (Test-Path $plog) {
+        $pm = [regex]::Match((Get-Content -LiteralPath $plog -Raw -ErrorAction SilentlyContinue), 'dsh web:\s*(https?://[^\s"<>|]+)')
+        if ($pm.Success) {
+            $pu = $pm.Groups[1].Value.TrimEnd(')',']',',','.','|',';','；','，')
+            $hm = [regex]::Match($pu, 'https?://(localhost|127\.0\.0\.1|\[::1\]):(\d+)')
+            if ($hm.Success -and (Wait-Port ([int]$hm.Groups[2].Value) 2)) {
+                Ok "门户实例已在运行, 直接复用: $pu"
+                try { Start-Process $pu | Out-Null; Ok "已自动打开浏览器" }
+                catch { Warn "自动打开浏览器失败, 请手动复制上面的地址访问" }
+                return
+            }
+        }
+    }
+    if (-not (Test-Path (Join-Path $Harness "node_modules"))) {
+        Err "deepseek-harness 依赖未安装, 无法启动门户。请先完整执行本脚本 3/6 或手动 cd '$Harness' 后 pnpm install"
+        return
+    }
+    $nodeExe = Ensure-NodeRuntime
+    if (-not $nodeExe) { Err "node 不可用, 无法启动门户"; return }
+    $pnpm = Ensure-Pnpm $nodeExe
+    if (-not $pnpm) { Err "pnpm 不可用, 无法启动门户"; return }
+    # 门户插件依赖(~/.dsh/profiles/web)缺 node_modules 时在线安装
+    $web = Join-Path $env:USERPROFILE ".dsh\profiles\web"
+    if (Test-Path (Join-Path $web "package.json")) {
+        if (-not (Test-Path (Join-Path $web "node_modules"))) {
+            Warn "~/.dsh/profiles/web 插件未安装, 在线 pnpm install(需联网, 数百 MB, 可能数分钟)..."
+            Push-Location $web
+            try { & $pnpm install --no-frozen-lockfile; if ($LASTEXITCODE -ne 0) { Err "插件安装失败, 请检查网络后重试"; return } }
+            finally { Pop-Location }
+        }
+    }
+    $gen = New-DshPatch
+    if (-not $gen) { Err "未找到 dsh-cordis.patch.yml 模板, 无法启动门户"; return }
+    $logDir = Join-Path $RUNTIME "logs"
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $o = Join-Path $logDir "dsh-web.out.log"; $e = Join-Path $logDir "dsh-web.err.log"
+    Remove-Item $o, $e -Force -ErrorAction SilentlyContinue
+    # 通过临时 launcher 脚本在 harness 目录以 node 直跑 dsh(绕开 pnpm/cmd 引号问题)
+    $launcher = Join-Path $logDir "dsh-web-launch.cmd"
+    $cmdline = '@echo off' + "`r`n" + 'cd /d "' + $Harness + '" && "' + $nodeExe + '" --import tsx/esm apps/cli/src/bin.ts web --patch "' + $gen + '" > "' + $o + '" 2> "' + $e + '"'
+    [IO.File]::WriteAllText($launcher, $cmdline, (New-Object System.Text.UTF8Encoding($false)))
+    Ok "后台启动 dsh web(隐藏窗口)..."
+    $proc = Start-Process -FilePath $launcher -WindowStyle Hidden -PassThru
+
+    # 轮询日志解析门户地址(最多 120s)并自动开浏览器
+    $url = $null; $outTxt = $null; $errTxt = $null
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt 120) {
+        Start-Sleep -Seconds 3
+        if (Test-Path $o) { $outTxt = Get-Content -LiteralPath $o -Raw -ErrorAction SilentlyContinue }
+        if (Test-Path $e) { $errTxt = Get-Content -LiteralPath $e -Raw -ErrorAction SilentlyContinue }
+        $url = Select-PortalUrl $outTxt $errTxt
+        if ($url) { break }
+        if ($proc.HasExited) { break }
+    }
+    if ($url) {
+        Ok "门户已就绪: $url"
+        try { Start-Process $url | Out-Null; Ok "已自动打开浏览器" }
+        catch { Warn "自动打开浏览器失败, 请手动复制上面的地址访问" }
+        Warn "门户在后台运行(隐藏窗口/日志: $o); 业务后端(MCP)由 dsh 按补丁自动拉起; 停止方式: 关闭隐藏窗口或重启后重跑 setup.bat -Product"
+    } else {
+        if ($proc.HasExited) {
+            Err "dsh web 进程已退出(启动失败)。错误日志尾部:"
+        } else { Warn "120s 内未解析到门户地址, 请查看日志: $o / $e" }
+        if (Test-Path $e) { Get-Content -LiteralPath $e -Tail 15 | ForEach-Object { Write-Host "      $_" } }
+    }
+}
+
+# ------------------------------------------------------------ 0. 体检
+Write-Host "平台化企业智能问数工作台 - 一键配置" -ForegroundColor Magenta
+Write-Host "仓库根: $ROOT"
+Step "0/6 环境体检"
+
+# --- Python ---
+$pythonExe = $null
+$g = Get-Command python -ErrorAction SilentlyContinue
+if ($g) { $pythonExe = $g.Source }
+if (-not $pythonExe) {
+    $gp = Get-Command py -ErrorAction SilentlyContinue
+    if ($gp) {
+        try { $pythonExe = (& py -3 -c "import sys;print(sys.executable)" 2>$null | Select-Object -First 1) }
+        catch { $pythonExe = $null }
+    }
+}
+if (-not $pythonExe) {
+    # 常见安装目录(用户级 winget / 官方安装器)
+    $cands = @(
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe")
+    )
+    $pythonExe = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+$pyOk = $false
+if ($pythonExe) {
+    & $pythonExe -c "import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)" 2>$null
+    if ($LASTEXITCODE -eq 0) { $pyOk = $true }
+}
+if ($pyOk) {
+    $ver = & $pythonExe -c "import sys;print('.'.join(map(str,sys.version_info[:3])))"
+    Ok "Python $ver ($pythonExe)"
+} elseif (-not $pythonExe) {
+    if ($AutoInstall) {
+        Warn "未检测到 Python, 自动下载官方 Python $PY_VERSION 安装器并静默安装(约 28MB, 需联网)..."
+        New-Item -ItemType Directory -Force -Path (Join-Path $RUNTIME "installers") | Out-Null
+        $inst = Join-Path $RUNTIME "installers\$PY_EXE_NAME"
+        $installed = $false
+        if (Download-File $PY_EXE_URL $inst "Python $PY_VERSION") {
+            Warn "正在静默安装(用户级, 不弹窗, 约 1-2 分钟), 请勿关闭本窗口 ..."
+            $pr = Start-Process -FilePath $inst -ArgumentList "/quiet","InstallAllUsers=0","PrependPath=1","Include_test=0" -Wait -PassThru
+            if ($pr.ExitCode -in @(0, 3010)) { $installed = $true; Ok "Python 安装器已结束(退出码 $($pr.ExitCode))" }
+            else { Warn "Python 安装器退出码 $($pr.ExitCode), 尝试 winget 兜底" }
+        }
+        $p = Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe"
+        if ((-not $installed -or -not (Test-Path $p)) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+            Warn "改用 winget 安装 Python 3.13 ..."
+            winget install -e --id Python.Python.3.13 --scope user --silent --accept-package-agreements --accept-source-agreements | Out-Null
+        }
+        if (Test-Path $p) {
+            $pythonExe = $p
+            Ok "Python 已自动安装: $p"
+        } else { Err "自动安装后未找到解释器, 请手动安装 Python 3.11+ 后重试: https://www.python.org/downloads/"; exit 1 }
+    } else {
+        Err "未检测到 Python 3.11+。重跑加 -AutoInstall 可自动下载安装, 或手动安装: https://www.python.org/downloads/"
+        exit 1
+    }
+} else {
+    Err "Python 版本过低(<3.11)。请升级 Python 后重试"; exit 1
+}
+
+# --- MySQL (端口探测, 不依赖 PATH 里的 mysql.exe) ---
+$mysqlUp = Wait-Port 3306 3
+if ($mysqlUp) { Ok "MySQL 服务可达 127.0.0.1:3306" }
+else {
+    if ($AutoMySQLZip) {
+        Warn "3306 未通, 尝试下载官方 MySQL 便携版($MYSQL_ZIP_NAME)到 .runtime ..."
+        New-Item -ItemType Directory -Force -Path $RUNTIME | Out-Null
+        $zip = Join-Path $RUNTIME $MYSQL_ZIP_NAME
+        if (-not (Test-Path $zip)) {
+            $dlOk = $false
+            foreach ($u in $MYSQL_ZIP_URLS) {
+                if (Download-File -Url $u -Out $zip -Label "MySQL $MYSQL_ZIP_NAME" -Zip) { $dlOk = $true; break }
+            }
+            if (-not $dlOk) { Err "MySQL 下载失败(官方 CDN 与国内镜像均不可达或被网关拦截)。可手动下载 $MYSQL_ZIP_NAME 放入 $RUNTIME 后重跑"; exit 1 }
+        }
+        $mysqlDir = Join-Path $RUNTIME $MYSQL_ZIP_NAME.Replace(".zip","")
+        if (-not (Test-Path $mysqlDir)) {
+            try { Expand-Archive -Path $zip -DestinationPath $RUNTIME -Force }
+            catch { Err "解压 MySQL 便携包失败: $($_.Exception.Message)"; exit 1 }
+        }
+        $mysqld = Join-Path $mysqlDir "bin\mysqld.exe"
+        if (-not (Test-Path $mysqld)) { Err "解压后未找到 mysqld.exe"; exit 1 }
+        $dataDir = Join-Path $mysqlDir "data"
+        if (-not (Test-Path $dataDir)) {
+            Warn "初始化数据目录(root 空密码, 需 10~60 秒, 日志见 .runtime) ..."
+            # PS5.1 陷阱: 原生命令的 stderr 若用 2>&1 合并, 在 EAP=Stop 下每行日志都会变成
+            # NativeCommandError 致命错误而中断(用户实测 mysqld 初始化即被误杀)。
+            # 解决: stderr 直接落盘到 mysql-init.err.log(不用 2>&1), 并在调用期临时把 EAP 降为
+            # Continue(pwsh 7.3+ 即便落盘也可能按 EAP 抛错), 成功静默, 失败时提示日志路径排查。
+            $initLog = Join-Path $RUNTIME "mysql-init.err.log"
+            $eapSave = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+            & $mysqld --initialize-insecure --basedir=$mysqlDir --datadir=$dataDir --console 2>$initLog
+            $initCode = $LASTEXITCODE
+            $ErrorActionPreference = $eapSave
+            if ($initCode -ne 0) { Err "mysqld 初始化失败, 日志: $initLog (通常需先安装 VC++ 运行库: vc_redist.x64)"; exit 1 }
+        }
+        $proc = Get-Process mysqld -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$mysqlDir*" } | Select-Object -First 1
+        if (-not $proc) {
+            # 防残留: 上次中断可能留下其它解压目录的便携 mysqld 占住 3306, 先探测再处理
+            $stale = Get-NetTCPConnection -LocalPort 3306 -State Listen -ErrorAction SilentlyContinue
+            if ($stale) {
+                $owner = Get-Process -Id $stale[0].OwningProcess -ErrorAction SilentlyContinue
+                if ($owner -and $owner.ProcessName -eq 'mysqld') {
+                    Warn ("检测到残留 mysqld(PID {0}, {1}) 占住 3306, 先结束再启动本实例" -f $owner.Id, $owner.Path)
+                    Stop-Process -Id $owner.Id -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 2
+                } else {
+                    Err "端口 3306 已被其它程序(pid $($owner.Id))占用, 请先释放端口后重试"; exit 1
+                }
+            }
+            Warn "后台启动 mysqld(仅本次会话, root 空密码) ..."
+            $log = Join-Path $RUNTIME "mysqld.err.log"
+            Start-Process -FilePath $mysqld -ArgumentList "--basedir=$mysqlDir","--datadir=$dataDir","--port=3306" -WindowStyle Hidden -RedirectStandardError $log
+        }
+        if (Wait-Port 3306 60) {
+            $mysqlUp = $true
+            if (-not $MySQLRootPassword) { $MySQLRootPassword = "" }  # 便携实例 root 为空
+            Ok "便携 MySQL 已启动(数据目录 .runtime, root 密码为空)"
+        } else {
+            # 失败当场把日志尾部打到屏幕, 便于定位(杀软拦截/端口占用/VC++ 缺失等)
+            if (Test-Path $log) {
+                $lines = @(Get-Content $log)
+                Err "便携 MySQL 启动失败, 错误日志尾部(共 $($lines.Count) 行):"
+                $lines | Select-Object -Last 25 | ForEach-Object { Write-Host ("    " + $_) -ForegroundColor DarkYellow }
+                if ($lines.Count -eq 0) { Write-Host "    (日志为空: 常见原因是杀毒软件拦截便携版 mysqld, 请将 .runtime 目录加入白名单后重试)" -ForegroundColor DarkYellow }
+            }
+            Err "请手动安装 MySQL 8 后重试, 或把上方日志发给我们排查"; exit 1
+        }
+    } else {
+        Warn "3306 端口未通(未检测到 MySQL 服务)。"
+        Warn "  可选: 加 -AutoMySQLZip 自动下载官方 MySQL 8.0 便携版自举(需联网, ~500MB 解压空间)"
+        Warn "  或手动安装 MySQL 8 后重跑本脚本。加 -SkipDB 可跳过数据库步骤先行体验。"
+    }
+}
+
+# --- Node / pnpm (仅 dsh 图形门户需要; 等价宿主/评测不需要) ---
+$nodeOk = [bool](Get-Command node -ErrorAction SilentlyContinue)
+$pnpmOk = [bool](Get-Command pnpm -ErrorAction SilentlyContinue)
+if ($nodeOk) { Ok "node $(node --version 2>$null)" } else { Warn "未检测到 node(仅 dsh 图形门户需要)" }
+if ($pnpmOk) { Ok "pnpm $(pnpm --version 2>$null)" } else { Warn "未检测到 pnpm(仅 dsh 图形门户需要)" }
+$wingetOk = [bool](Get-Command winget -ErrorAction SilentlyContinue)
+if ($wingetOk) { Ok "winget 可用(自动安装通道就绪)" } else { Warn "未检测到 winget, 缺失组件将无法自动安装" }
+
+# 概要 (PS 5.1 无三元运算符 ?:, 用 if 表达式)
+$pyS   = if ($pyOk)     { '有' } else { '缺' }
+$myS   = if ($mysqlUp)  { '有' } else { '缺' }
+$nodeS = if ($nodeOk)   { '有' } else { '缺' }
+$pnpmS = if ($pnpmOk)   { '有' } else { '缺' }
+$wingS = if ($wingetOk) { '有' } else { '缺' }
+Write-Host ("`n  体检结论: Python={0} MySQL(3306)={1} node={2} pnpm={3} winget={4}" -f $pyS,$myS,$nodeS,$pnpmS,$wingS)
+if (-not $mysqlUp -and -not $SkipDB) {
+    if (-not $AutoMySQLZip) { Err "MySQL 不可用且未启用 -AutoMySQLZip, 后续建库步骤将失败。建议重跑: setup.bat -AutoMySQLZip -AutoInstall"; exit 1 }
+}
+
+# ------------------------------------------------------------ 1. venv + 依赖
+Step "1/6 Python 虚拟环境与依赖"
+if (-not (Test-Path (Join-Path $VENV "Scripts\activate.ps1"))) {
+    & $pythonExe -m venv $VENV
+    if ($LASTEXITCODE -ne 0) { Err "venv 创建失败"; exit 1 }
+    Ok "新建 venv: $VENV"
+} else { Ok "venv 已存在, 复用" }
+if (Test-Path (Join-Path $ROOT "requirements.txt")) {
+    & $PY -m pip install --disable-pip-version-check -q -r (Join-Path $ROOT "requirements.txt")
+    if ($LASTEXITCODE -ne 0) { Err "pip 安装依赖失败, 请检查网络"; exit 1 }
+    Ok "依赖安装完成 (requirements.txt)"
+}
+
+# ------------------------------------------------------------ 2. 建库造数
+Step "2/6 MySQL 建库与造数 (bi_workbench + hr_bi)"
+if ($SkipDB) { Warn "已跳过 (-SkipDB), 若未初始化请勿运行业务" }
+elseif (-not $mysqlUp) { Err "MySQL 不可用, 建库步骤跳过。请先解决 MySQL 再重跑" }
+elseif (Test-BiDbReady) {
+    Ok "双库已初始化并可连通 (bi_ro/hr_ro 只读账号探活通过), 跳过重复建库造数"
+    Warn "如需重置演示数据: 手动执行 init_db.py / db_init.py (需 root 密码), 或删库后重跑本脚本"
+}
+else {
+    if (-not $PSBoundParameters.ContainsKey('MySQLRootPassword') -and $AutoMySQLZip -and $mysqlUp) {
+        # 便携实例(root 空密码)但用户未显式给密码 -> 询问是否为空
+        if ($MySQLRootPassword -eq "" ) {
+            $ans = Read-Host "  检测到便携 MySQL(root 空密码)。直接回车=root密码为空; 输入'#'=改用其他密码"
+            if ($ans -ne "" -and $ans -ne "#") { $MySQLRootPassword = $ans }
+        }
+    }
+    if (-not $MySQLRootPassword) {
+        $MySQLRootPassword = Read-Host "  请输入 MySQL root 密码(便携实例直接回车)"
+    }
+    & $PY (Join-Path $ROOT "bi_workbench\scripts\init_db.py") --password $MySQLRootPassword
+    if ($LASTEXITCODE -ne 0) { Err "bi_workbench 初始化失败(MySQL 是否已启动? 密码是否正确?)"; exit 1 }
+    Ok "bi_workbench 库已建 + 造数完成"
+    & $PY (Join-Path $ROOT "hr_backend\db_init.py") --password $MySQLRootPassword
+    if ($LASTEXITCODE -ne 0) { Err "hr_bi 初始化失败"; exit 1 }
+    Ok "hr_bi 库已建 + 造数完成"
+}
+
+# ------------------------------------------------------------ 3. dsh 门户装配 + 依赖自举
+Step "3/6 dsh 门户装配与依赖自举"
+if ($SkipPortal) { Warn "已跳过 (-SkipPortal); 等价宿主/评测不需要此步" }
+else {
+    $dshHome = Join-Path $env:USERPROFILE ".dsh"
+    # 先确保 ~/.dsh 存在, 否则首次 Copy-Item 会把源作为 .dsh 本身拷贝
+    New-Item -ItemType Directory -Force -Path $dshHome | Out-Null
+    $srcProf = Join-Path $ROOT "deployment\dsh-home"
+    $marker  = Join-Path $dshHome ".setup-assembled"
+    if (Test-Path $srcProf) {
+        # 幂等: 已装配过(有标记)且未强制重建 -> 跳过覆盖, 避免打扰正在运行/只读的门户文件
+        if ((Test-Path $marker) -and -not $ResetProfile) {
+            Ok "dsh-home 已装配过(标记 .setup-assembled), 跳过模板覆盖; 如需刷新删该标记或加 -ResetProfile"
+        } else {
+            # 遍历 dsh-home 顶层条目逐一装配: 目标 .dsh 已存在, 拷贝为 .dsh\<leaf>,
+            # 保证 profiles\web 落到 .dsh\profiles\web(leaf 与 .dsh 布局一致)
+            foreach ($item in (Get-ChildItem -Path $srcProf -Force)) {
+                if (-not $item.PSIsContainer) { continue }
+                try {
+                    Copy-Item -Path $item.FullName -Destination $dshHome -Recurse -Force
+                    Ok "已装配: $($item.Name) -> $dshHome\$($item.Name)"
+                } catch {
+                    # 单条目被占用/只读(如门户运行中)不应中断整条产品流程
+                    Warn "装配 $($item.Name) 未完全成功(可能被占用或只读): $($_.Exception.Message)"
+                }
+            }
+            try { Set-Content -LiteralPath $marker -Value (Get-Date -Format "yyyy-MM-dd HH:mm") -Encoding UTF8 | Out-Null } catch {}
+        }
+    } else { Warn "deployment\dsh-home 不存在, 跳过" }
+
+    # ---- 门户插件依赖(~/.dsh/profiles/web): 缺失/旧冲突/ResetProfile 时在线安装 ----
+    $dshWeb = Join-Path $dshHome "profiles\web"
+    if (Test-Path (Join-Path $dshWeb "package.json")) {
+        $needInst = -not (Test-Path (Join-Path $dshWeb "node_modules"))
+        $stale    = Test-Path (Join-Path $dshWeb "node_modules\@linxin666\dsh-web-ui-all")
+        if ($ResetProfile) {
+            Warn "(-ResetProfile) 删除旧 ~/.dsh/profiles/web 并从模板重建 ..."
+            Remove-Item $dshWeb -Recurse -Force -ErrorAction SilentlyContinue
+            $srcWeb = Join-Path $srcProf "profiles\web"
+            if (Test-Path $srcWeb) { Copy-Item -LiteralPath $srcWeb -Destination $dshWeb -Recurse -Force }
+            $needInst = $true; $stale = $false
+        }
+        if ($needInst -or $stale) {
+            if ($stale) { Warn "检测到旧冲突插件依赖(web-ui-all 残留), 执行 pnpm install 清理并同步到新依赖树 ..." }
+            $nodeExe = Ensure-NodeRuntime
+            $pnpm = $null
+            if ($nodeExe) { $pnpm = Ensure-Pnpm $nodeExe }
+            if (-not $pnpm) {
+                Warn "node/pnpm 不可用, 本次跳过插件在线安装(重跑加 -AutoInstall, 或选 [F] 时会自动尝试)"
+            } else {
+                Push-Location $dshWeb
+                try {
+                    Warn "在线安装门户插件全家桶 (pnpm install, 数百 MB, 需联网数分钟) ..."
+                    & $pnpm install --no-frozen-lockfile
+                    if ($LASTEXITCODE -eq 0) { Ok "门户插件依赖已就绪 (~/.dsh/profiles/web)" }
+                    else { Warn "pnpm install 失败(见上方输出), 可重跑本脚本或稍后选 [F] 重试" }
+                } finally { Pop-Location }
+            }
+        } else { Ok "门户插件依赖已就绪 (~/.dsh/profiles/web)" }
+    }
+
+    # ---- deepseek-harness 依赖自举 (有源码但缺 node_modules 时自动安装) ----
+    $harness = Join-Path $ROOT "deepseek-harness"
+    $hasSrc = Test-Path (Join-Path $harness "package.json")
+    $hasMod = Test-Path (Join-Path $harness "node_modules")
+    if (-not $hasSrc) {
+        Warn "未找到 deepseek-harness 源码(等价宿主/评测无需; 若要 dsh 门户, 请把'门户增强包'解压覆盖到本目录后重跑)"
+    } elseif ($hasMod) {
+        Ok "deepseek-harness 依赖已就绪(node_modules 存在), 跳过安装"
+    } else {
+        Warn "deepseek-harness 缺少 node_modules, 开始自动安装门户依赖(需联网, 下载约 1.5GB, 可能 10-20 分钟; 可用 -SkipPortal 跳过) ..."
+        # --- 定位/安装 node (优先便携 zip 直下, 无需管理员/winget) ---
+        $nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source
+        if (-not $nodeExe) {
+            $c = Join-Path $env:LOCALAPPDATA "Programs\nodejs\node.exe"
+            if (Test-Path $c) { $nodeExe = $c }
+        }
+        if (-not $nodeExe) { $nodeExe = Find-PortableNode }
+        if (-not $nodeExe -and $AutoInstall) {
+            Warn "未检测到 node, 自动下载官方 Node $NODE_VERSION 便携包到 .runtime (约 36MB)..."
+            $nodeExe = Install-PortableNode
+        }
+        if (-not $nodeExe) {
+            Warn "未检测到 node, 且未启用自动下载(重跑加 -AutoInstall)或下载失败。跳过门户依赖, 等价宿主仍可用"
+        } else {
+            Ok "node $(& $nodeExe --version 2>$null)"
+            # --- 定位/安装 pnpm (node 自带 npm, 用 npm -g 装 pnpm) ---
+            $pnpm = Ensure-Pnpm $nodeExe
+            if (-not $pnpm) {
+                Warn "pnpm 安装失败, 请手动执行 npm install -g pnpm 后重跑本脚本"
+            } else {
+                Ok "pnpm $(& $pnpm --version 2>$null)"
+                Push-Location $harness
+                try {
+                    Warn "执行 pnpm install (联网拉取依赖) ..."
+                    & $pnpm install --no-frozen-lockfile
+                    if ($LASTEXITCODE -eq 0) {
+                        Ok "deepseek-harness 依赖安装完成。回到第 5 步选 [F] 可一键启动门户并自动打开浏览器(或 setup.bat -Product)"
+                    } else {
+                        Warn "pnpm install 失败(见上方输出)。可重跑本脚本, 或在 deepseek-harness 内手动执行 pnpm install"
+                    }
+                } finally { Pop-Location }
+            }
+        }
+    }
+}
+
+# ------------------------------------------------------------ 4. 评测回归
+Step "4/6 评测回归"
+if ($Verify) {
+    & $PY (Join-Path $ROOT "eval\runner.py")
+    if ($LASTEXITCODE -ne 0) { Warn "评测存在未通过用例, 请看上方输出" } else { Ok "评测回归通过" }
+} else { Warn "已跳过 (加 -Verify 执行 47 条评测回归)" }
+
+# ------------------------------------------------------------ 5. 启动指引 (菜单式)
+Step "5/6 启动方式选择"
+Write-Host ""
+Write-Host "  请选择要启动的方式 (输入字母后回车):" -ForegroundColor Yellow
+Write-Host "    [F] 一键产品: 启动 dsh 图形门户 + 自动打开浏览器  ← 推荐(等价'双击即用')"
+Write-Host "    [D] 前台启动 dsh 门户(输出留在本窗口, Ctrl+C 退出)"
+Write-Host "    [A] 等价宿主演示  (无需 dsh/Node, 命令行验证闭环)"
+Write-Host "    [B] 冒烟自检       (hr_backend 快速自检)"
+Write-Host "    [C] 完整测试集评测 (47 条自动用例, 写 eval/result.json)"
+Write-Host "    [E] 不启动, 结束配置"
+Write-Host ""
+$choice = ""
+if ([Console]::IsInputRedirected) {
+    if ($Product) { $choice = "F" } else { $choice = "E" }
+} else {
+    $choice = (Read-Host "  请输入 F/D/A/B/C/E").Trim().ToUpper()
+}
+switch ($choice) {
+    "A" {
+        Ok "启动等价宿主演示(双后端, Ctrl+C 退出)..."
+        & $PY (Join-Path $ROOT "bi_workbench\scripts\dual_backends.py")
+    }
+    "B" {
+        Ok "执行冒烟自检..."
+        & $PY (Join-Path $ROOT "hr_backend\smoke_hr.py")
+    }
+    "C" {
+        Ok "运行 47 条评测回归..."
+        & $PY (Join-Path $ROOT "eval\runner.py")
+    }
+    "D" {
+        $h = Join-Path $ROOT "deepseek-harness"
+        if (-not (Test-Path (Join-Path $h "package.json"))) {
+            Warn "未找到 deepseek-harness 源码(门户运行时), 无法启动门户"
+        } elseif (-not (Test-Path (Join-Path $h "node_modules"))) {
+            Warn "deepseek-harness 依赖未安装。请重跑本脚本(3/6 会自动 pnpm install), 或手动: cd '$h' ; pnpm i"
+        } else {
+            $nodeExe = Ensure-NodeRuntime
+            if (-not $nodeExe) { Err "node 不可用, 无法启动门户"; break }
+            $pnpm = Ensure-Pnpm $nodeExe
+            if (-not $pnpm) { Err "pnpm 不可用, 无法启动门户"; break }
+            $gen = New-DshPatch
+            if (-not $gen) { Err "未找到 dsh-cordis.patch.yml 模板"; break }
+            Ok "前台启动 dsh 图形门户(首次较慢, Ctrl+C 退出)..."
+            Push-Location $h
+            try { & $pnpm dsh web --patch $gen }
+            finally { Pop-Location }
+        }
+    }
+    "F" {
+        Start-DshPortal (Join-Path $ROOT "deepseek-harness")
+    }
+    default { Ok "本次不启动任何服务, 配置完成" }
+}
+
+# ------------------------------------------------------------ 6. 尾注
+Step "6/6 备注"
+if ($mysqlUp -and (Get-Process mysqld -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$RUNTIME*" })) {
+    Warn "当前运行的是 .runtime 便携 MySQL(root 空密码)。关机/重启后需重新执行 setup.bat -AutoMySQLZip -SkipDB -SkipPortal 启动它。"
+}
+Write-Host "完成。以上命令请用 PowerShell 执行。" -ForegroundColor Green

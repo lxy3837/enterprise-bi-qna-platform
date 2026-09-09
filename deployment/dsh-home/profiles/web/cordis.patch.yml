@@ -1,0 +1,12 @@
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+
+# 会话默认 agent preset: 从 bundle 的 standard 改为 enterprise-qna
+# (enterprise-qna 挂接了 skill 通道 + genui 渲染，见 ~/.dsh/.agent-presets/enterprise-qna)。
+- id: agent-presets
+  config:
+    default: enterprise-qna
+
+- id: live-stats
+  disabled: true

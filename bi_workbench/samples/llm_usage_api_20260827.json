@@ -1,0 +1,76 @@
+{
+ "code": 0,
+ "msg": "ok",
+ "data": [
+  {
+   "ts": "2026-08-27 09:10:00",
+   "dept": "研发",
+   "model": "deepseek-chat",
+   "prompt_tokens": 1800,
+   "completion_tokens": 3200,
+   "cost": 0.032,
+   "success": 1,
+   "blocked": 0
+  },
+  {
+   "ts": "2026-08-27 09:15:12",
+   "dept": "交付一部",
+   "model": "deepseek-chat",
+   "prompt_tokens": 2400,
+   "completion_tokens": 5100,
+   "cost": 0.051,
+   "success": 1,
+   "blocked": 0
+  },
+  {
+   "ts": "2026-08-27 09:20:05",
+   "dept": "交付二部",
+   "model": "deepseek-coder",
+   "prompt_tokens": 4200,
+   "completion_tokens": 9800,
+   "cost": 0.086,
+   "success": 1,
+   "blocked": 0
+  },
+  {
+   "ts": "2026-08-27 09:31:44",
+   "dept": "实施部",
+   "model": "deepseek-chat",
+   "prompt_tokens": 1300,
+   "completion_tokens": 2100,
+   "cost": 0.021,
+   "success": 1,
+   "blocked": 0
+  },
+  {
+   "ts": "2026-08-27 09:42:18",
+   "dept": "研发",
+   "model": "deepseek-reasoner",
+   "prompt_tokens": 5200,
+   "completion_tokens": 12400,
+   "cost": 0.24,
+   "success": 1,
+   "blocked": 0
+  },
+  {
+   "ts": "2026-08-27 10:03:37",
+   "dept": "交付二部",
+   "model": "deepseek-chat",
+   "prompt_tokens": 0,
+   "completion_tokens": 0,
+   "cost": 0.005,
+   "success": 0,
+   "blocked": 1
+  },
+  {
+   "ts": "2026-08-27 10:11:02",
+   "dept": "其他",
+   "model": "deepseek-chat",
+   "prompt_tokens": 900,
+   "completion_tokens": 1500,
+   "cost": 0.014,
+   "success": 1,
+   "blocked": 0
+  }
+ ]
+}

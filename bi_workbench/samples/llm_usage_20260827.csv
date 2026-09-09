@@ -1,0 +1,8 @@
+﻿ts,dept,model,prompt_tokens,completion_tokens,cost,success,blocked
+2026-08-27 09:10:00,研发,deepseek-chat,1800,3200,0.032,1,0
+2026-08-27 09:15:12,交付一部,deepseek-chat,2400,5100,0.051,1,0
+2026-08-27 09:20:05,交付二部,deepseek-coder,4200,9800,0.086,1,0
+2026-08-27 09:31:44,实施部,deepseek-chat,1300,2100,0.021,1,0
+2026-08-27 09:42:18,研发,deepseek-reasoner,5200,12400,0.24,1,0
+2026-08-27 10:03:37,交付二部,deepseek-chat,0,0,0.005,0,1
+2026-08-27 10:11:02,其他,deepseek-chat,900,1500,0.014,1,0

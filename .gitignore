@@ -1,0 +1,25 @@
+# ===== 运行时 / 缓存 / 第三方重件（不入库） =====
+bi_workbench/.venv/
+deepseek-harness/
+# 独立仓库项目（github.com/lxy3837/deepseek-chat-client），不在主工程内重复维护
+deepseek-chat-client/
+.runtime/
+.pnpm-cache/
+.pnpm-store/
+.pnpm-tools/
+node_modules/
+*.log
+
+# ===== 隐私：真实会话记录，严禁入库 =====
+session.v2.jsonl
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ===== 编辑器 / 系统 =====
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

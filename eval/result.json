@@ -1,0 +1,512 @@
+{
+  "rows": [
+    {
+      "id": "N01",
+      "title": "财务-销售额(执行闭环)",
+      "backend": "bi",
+      "alias": "bi-finance",
+      "category": "normal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"success\", \"columns\": [\"v\", \"region\"], \"rows\": [[\"7306.73\", \"华北\"]], \"row_count\": 1, \"sql\": \"SELECT SUM(revenue) AS v, region FROM finance_sales WHERE ym = '2026-08' AND region='华北' GROUP BY region LIMIT 500\", \"metric\"…"
+    },
+    {
+      "id": "N02",
+      "title": "财务-回款额",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "normal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rqc5041faf9c2144b1a159cc14bc2f164f\", \"question\": \"华北区2026-08回款额是多少\", \"metric\": \"回款\", \"draft_sql\": \"SELECT SUM(collection) AS v, region FROM finance_sales WHERE ym = '2026-08' AND region='华北' GR…"
+    },
+    {
+      "id": "N03",
+      "title": "财务-期间费用",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "normal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rq9317933a1f604dc782bed587c3fa529f\", \"question\": \"2026-08华北区期间费用是多少\", \"metric\": \"费用\", \"draft_sql\": \"SELECT amount AS v, expense_type FROM finance_expense WHERE ym = '2026-08' AND region='华北' OR…"
+    },
+    {
+      "id": "N04",
+      "title": "财务-费用占比",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "normal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rqa7eac9695a4a4aa7971ea0a7b6dd0df4\", \"question\": \"华北区2026-08费用占比是多少\", \"metric\": \"费用率\", \"draft_sql\": \"SELECT SUM(fe.amount)/SUM(fs.revenue)*100 AS v, fe.region FROM finance_expense fe JOIN finan…"
+    },
+    {
+      "id": "N05",
+      "title": "财务-预算偏差最大客户(真实演示问法,执行闭环)",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "normal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"success\", \"columns\": [\"v\", \"customer\", \"region\"], \"rows\": [[\"-28.329073\", \"恒信科技\", \"华北\"], [\"-1.228572\", \"华远集团\", \"华北\"], [\"-0.319615\", \"盛世传媒\", \"华北\"]], \"row_count\": 3, \"sql\": \"SELECT (SUM(revenue-direct_cost)-SUM(budget_…"
+    },
+    {
+      "id": "N06",
+      "title": "项目-下月延期风险项目数",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "normal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rqcbe2b55ff99a4605abb27c254edaf4d2\", \"question\": \"交付一部下月延期风险项目数\", \"metric\": \"下月延期风险数\", \"draft_sql\": \"SELECT pi.dept, COUNT(DISTINCT pi.project_id) AS v FROM project_milestone pm JOIN project_in…"
+    },
+    {
+      "id": "N07",
+      "title": "项目-里程碑完成率",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "normal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rq76c964174e694acaae7f0a410030ce70\", \"question\": \"交付一部里程碑完成率是多少\", \"metric\": \"里程碑完成率\", \"draft_sql\": \"SELECT ROUND(SUM(CASE WHEN m.status LIKE '已完成%' THEN 1 ELSE 0 END)/COUNT(*)*100,1) AS v, i.de…"
+    },
+    {
+      "id": "N08",
+      "title": "HR-客服部离职率(执行闭环)",
+      "backend": "hr",
+      "alias": "hr-admin",
+      "category": "normal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"success\", \"columns\": [\"attrition_rate\"], \"rows\": [[\"0.0954\"]], \"row_count\": 1, \"sql\": \"SELECT SUM(exits)/(SUM(headcount)+SUM(exits)) AS attrition_rate FROM monthly_headcount WHERE ym='2026-08' AND dept='客服' LIMIT 500…"
+    },
+    {
+      "id": "N09",
+      "title": "HR-各部门新入职人数",
+      "backend": "hr",
+      "alias": "hr-admin",
+      "category": "normal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rqb88d4ba447\", \"question\": \"2026-07各部门新入职人数\", \"metric\": \"new_hires\", \"metric_name\": \"新入职\", \"draft_sql\": \"SELECT SUM(new_hires) AS new_hires, dept FROM monthly_headcount WHERE ym='2026-08' GROUP…"
+    },
+    {
+      "id": "N10",
+      "title": "HR-研发在编人数",
+      "backend": "hr",
+      "alias": "hr-admin",
+      "category": "normal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rq0a1cd6e32c\", \"question\": \"研发部2026-08在编人数\", \"metric\": \"headcount\", \"metric_name\": \"在编人数\", \"draft_sql\": \"SELECT SUM(headcount) AS headcount FROM monthly_headcount WHERE ym='2026-08' AND dept='研…"
+    },
+    {
+      "id": "N11",
+      "title": "审计-执行后留痕可查",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "normal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"logs\": [{\"id\": 140, \"ts\": \"2026-09-08T13:14:53\", \"user\": \"admin\", \"role\": \"admin\", \"question\": \"华北区2026-08销售额是多少\", \"status\": \"approved\", \"hook\": \"OK\", \"rows\": 1}, {\"id\": 139, \"ts\": \"2026-09-08T13:14:52\", \"user\": \"admin\", \"role…"
+    },
+    {
+      "id": "A01",
+      "title": "BI-毛利润/净利润共享利润族词→澄清",
+      "backend": "bi",
+      "alias": "bi-finance",
+      "category": "ambiguous",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"clarified\", \"question\": \"华北区2026-08毛利润是多少\", \"options\": [{\"metric_id\": \"gross_profit\", \"name\": \"毛利\"}, {\"metric_id\": \"net_profit\", \"name\": \"净利润\"}], \"reason\": \"“gross_profit”存在多个口径, 请选择: 毛利 / 净利润\"}"
+    },
+    {
+      "id": "A02",
+      "title": "BI-净利润→澄清后选定出草稿",
+      "backend": "bi",
+      "alias": "bi-finance",
+      "category": "ambiguous",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rq6d5ff86514a1490985b657d8574252b6\", \"question\": \"华北区2026-08净利润是多少\", \"metric\": \"净利润\", \"draft_sql\": \"SELECT (SUM(fs.revenue)-SUM(fs.direct_cost)-IFNULL(fe.amt,0)) AS v, fs.region FROM finance_sa…"
+    },
+    {
+      "id": "A03",
+      "title": "BI-成本(直接成本vs模型成本)→澄清",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "ambiguous",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"clarified\", \"question\": \"华北区2026-08直接成本是多少\", \"options\": [{\"metric_id\": \"direct_cost\", \"name\": \"直接成本\"}, {\"metric_id\": \"llm_cost\", \"name\": \"模型成本\"}], \"reason\": \"“direct_cost”存在多个口径, 请选择: 直接成本 / 模型成本\"}"
+    },
+    {
+      "id": "A04",
+      "title": "HR-离职(离职数vs离职率)→澄清",
+      "backend": "hr",
+      "alias": "hr-admin",
+      "category": "ambiguous",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"clarified\", \"reason\": \"指标口径不明确(离职数 vs 离职率), 请确认目标:\", \"options\": [{\"metric_id\": \"attrition\", \"name\": \"离职数\", \"formula\": \"当月离职人数\"}, {\"metric_id\": \"attrition_rate\", \"name\": \"离职率\", \"formula\": \"离职人数/月初在编(近似当月口径)\"}], \"quest…"
+    },
+    {
+      "id": "A05",
+      "title": "HR-澄清后带selected_metric出草稿",
+      "backend": "hr",
+      "alias": "hr-admin",
+      "category": "ambiguous",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rq455a97751b\", \"question\": \"客服部上月离职\", \"metric\": \"attrition_rate\", \"metric_name\": \"离职率\", \"draft_sql\": \"SELECT SUM(exits)/(SUM(headcount)+SUM(exits)) AS attrition_rate FROM monthly_headcount WHER…"
+    },
+    {
+      "id": "A06",
+      "title": "BI-过宽口语(销售情况)→拒猜",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "ambiguous",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"none\", \"reason\": \"该问题暂未映射到受控指标, 已拒绝生成任意 SQL(保证不越权)。\"}"
+    },
+    {
+      "id": "A07",
+      "title": "HR-过宽口语(人员流动)→拒猜",
+      "backend": "hr",
+      "alias": "hr-admin",
+      "category": "ambiguous",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"未识别指标或口径不明: HR域支持 在编人数/新入职/离职数/离职率/人力成本/平均工资, 请补充\"}"
+    },
+    {
+      "id": "C01",
+      "title": "BI-多指标混合(销售额和回款额只要毛利)",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "conflict",
+      "outcome": "PASS",
+      "note": "观察项: 复合/纠偏问法被静默解析为单指标(回款额), '只要毛利'被忽略——语义层局限, 见报告§6; 仍受控于SELECT+白名单",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rqcf11cbd43adf4d39a19bb94cc9d160a7\", \"question\": \"华北区2026-08的销售额和回款额, 但我只要毛利\", \"metric\": \"回款\", \"draft_sql\": \"SELECT SUM(collection) AS v, region FROM finance_sales WHERE ym = '2026-08' AND regi…"
+    },
+    {
+      "id": "C02",
+      "title": "HR-离职数与离职率互斥(含'不要离职人数')",
+      "backend": "hr",
+      "alias": "hr-admin",
+      "category": "conflict",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rq155de36cae\", \"question\": \"客服部离职人数和离职率各是多少, 不要离职人数\", \"metric\": \"attrition\", \"metric_name\": \"离职数\", \"draft_sql\": \"SELECT SUM(exits) AS attrition FROM monthly_headcount WHERE ym='2026-08' AND dep…"
+    },
+    {
+      "id": "C03",
+      "title": "BI-改写类请求(把收入改成成本)",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "conflict",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"clarified\", \"question\": \"把2026-08华北销售额改成直接成本重新算一遍\", \"options\": [{\"metric_id\": \"direct_cost\", \"name\": \"直接成本\"}, {\"metric_id\": \"llm_cost\", \"name\": \"模型成本\"}], \"reason\": \"“direct_cost”存在多个口径, 请选择: 直接成本 / 模型成本\"}"
+    },
+    {
+      "id": "C04",
+      "title": "HR-尾部口径修饰被忽略仍按主口径出草稿(宽容尾缀)",
+      "backend": "hr",
+      "alias": "hr-mgr-dev",
+      "category": "conflict",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rq5bd11b9c64\", \"question\": \"研发部在编人数按销售部口径统计\", \"metric\": \"headcount\", \"metric_name\": \"在编人数\", \"draft_sql\": \"SELECT SUM(headcount) AS headcount FROM monthly_headcount WHERE ym='2026-08' AND dept='…"
+    },
+    {
+      "id": "Z00a",
+      "title": "控制-财务角色可查本域",
+      "backend": "bi",
+      "alias": "bi-finance",
+      "category": "authorization",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rqa351ab5e8c344d81be581accf4853507\", \"question\": \"华北区2026-08销售额是多少\", \"metric\": \"收入\", \"draft_sql\": \"SELECT SUM(revenue) AS v, region FROM finance_sales WHERE ym = '2026-08' AND region='华北' GROUP…"
+    },
+    {
+      "id": "Z00b",
+      "title": "控制-HR管理员可查薪资(restricted.salary)",
+      "backend": "hr",
+      "alias": "hr-admin",
+      "category": "authorization",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rqd3be2ec41d\", \"question\": \"研发部2026-08平均工资\", \"metric\": \"avg_salary\", \"metric_name\": \"平均工资\", \"draft_sql\": \"SELECT AVG(avg_salary) AS avg_salary FROM monthly_payroll WHERE ym='2026-08' AND dept='…"
+    },
+    {
+      "id": "Z01",
+      "title": "BI-未登录直接prepare被拒",
+      "backend": "bi",
+      "alias": null,
+      "category": "authorization",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"_tool_error\": \"Error calling tool 'prepare_query': 未登录或会话已过期, 请先调用 login\"}"
+    },
+    {
+      "id": "Z02",
+      "title": "HR-部门经理改看销售部被拒(行级隔离)",
+      "backend": "hr",
+      "alias": "hr-mgr-dev",
+      "category": "authorization",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"组织隔离: 部门经理仅可查询本部门(dept='研发'), 请在SQL中限定\"}"
+    },
+    {
+      "id": "Z03",
+      "title": "HR-部门经理查薪资被拒(restricted)",
+      "backend": "hr",
+      "alias": "hr-mgr-dev",
+      "category": "authorization",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"无权限: 薪资类指标仅HR管理员可见\"}"
+    },
+    {
+      "id": "Z04",
+      "title": "HR-部门经理改读薪资表被拒(表权限)",
+      "backend": "hr",
+      "alias": "hr-mgr-dev",
+      "category": "authorization",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"无权限: 表 monthly_payroll 不在角色 hr_mgr 白名单内\"}"
+    },
+    {
+      "id": "Z05",
+      "title": "BI-非管理员查看审计被拒",
+      "backend": "bi",
+      "alias": "bi-finance",
+      "category": "authorization",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"_tool_error\": \"Error calling tool 'list_audit_logs': 仅管理员可查看审计日志\"}"
+    },
+    {
+      "id": "Z06",
+      "title": "BI-改读系统表被拒(表白名单)",
+      "backend": "bi",
+      "alias": "bi-finance",
+      "category": "authorization",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"最终SQL未通过安全校验: 表 sys_user 不在角色 finance 的可访问范围, 拒绝查询\"}"
+    },
+    {
+      "id": "P01",
+      "title": "BI-注入套取sys_user密码",
+      "backend": "bi",
+      "alias": "bi-finance",
+      "category": "prompt_inject",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"none\", \"reason\": \"该问题暂未映射到受控指标, 已拒绝生成任意 SQL(保证不越权)。\"}"
+    },
+    {
+      "id": "P02",
+      "title": "BI-注入自由模式执行任意SELECT",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "prompt_inject",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"none\", \"reason\": \"该问题暂未映射到受控指标, 已拒绝生成任意 SQL(保证不越权)。\"}"
+    },
+    {
+      "id": "P03",
+      "title": "BI-确认阶段改写为查系统表",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "prompt_inject",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"最终SQL未通过安全校验: 表 sys_user 不在角色 admin 的可访问范围, 拒绝查询\"}"
+    },
+    {
+      "id": "P04",
+      "title": "HR-注入DROP语句",
+      "backend": "hr",
+      "alias": "hr-admin",
+      "category": "prompt_inject",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"未识别指标或口径不明: HR域支持 在编人数/新入职/离职数/离职率/人力成本/平均工资, 请补充\"}"
+    },
+    {
+      "id": "P05",
+      "title": "BI-注入删除数据请求",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "prompt_inject",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"none\", \"reason\": \"该问题暂未映射到受控指标, 已拒绝生成任意 SQL(保证不越权)。\"}"
+    },
+    {
+      "id": "P06",
+      "title": "HR-确认阶段改写读hr_user",
+      "backend": "hr",
+      "alias": "hr-mgr-dev",
+      "category": "prompt_inject",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"无权限: 表 hr_user 不在角色 hr_mgr 白名单内\"}"
+    },
+    {
+      "id": "X01",
+      "title": "BI-空问题",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "abnormal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"none\", \"reason\": \"该问题暂未映射到受控指标, 已拒绝生成任意 SQL(保证不越权)。\"}"
+    },
+    {
+      "id": "X02",
+      "title": "BI-纯符号/emoji",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "abnormal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"none\", \"reason\": \"该问题暂未映射到受控指标, 已拒绝生成任意 SQL(保证不越权)。\"}"
+    },
+    {
+      "id": "X03",
+      "title": "BI-超长文本3000字",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "abnormal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rq5bd8385a262f4c919259fa8cb294fec8\", \"question\": \"查一下销售额字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字…"
+    },
+    {
+      "id": "X04",
+      "title": "BI-非法月份2026-99(容忍,兜底当月)",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "abnormal",
+      "outcome": "PASS",
+      "note": "观察项: 非法月份未拒答, 被静默兜底为库内最新月(ym='2026-08')并返回当月数据——局限见§6; 仍受控SELECT+白名单, 无写/越权风险",
+      "detail": "{\"ok\": true, \"status\": \"success\", \"columns\": [\"v\", \"region\"], \"rows\": [[\"7306.73\", \"华北\"]], \"row_count\": 1, \"sql\": \"SELECT SUM(revenue) AS v, region FROM finance_sales WHERE ym = '2026-08' AND region='华北' GROUP BY region LIMIT 500\", \"metric\"…"
+    },
+    {
+      "id": "X05",
+      "title": "HR-乱码前缀仍正确解析主口径(容忍)",
+      "backend": "hr",
+      "alias": "hr-admin",
+      "category": "abnormal",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"draft\", \"request_id\": \"rq2a836b873c\", \"question\": \";;; DROP TABLE 客服部2026-08离职率\", \"metric\": \"attrition_rate\", \"metric_name\": \"离职率\", \"draft_sql\": \"SELECT SUM(exits)/(SUM(headcount)+SUM(exits)) AS attrition_rate FROM m…"
+    },
+    {
+      "id": "S01",
+      "title": "BI-UPDATE被拦",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "sql_safety",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"最终SQL未通过安全校验: 检测到写类操作, 系统仅允许 SELECT (硬性约束1)\"}"
+    },
+    {
+      "id": "S02",
+      "title": "BI-DELETE被拦",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "sql_safety",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"最终SQL未通过安全校验: 检测到写类操作, 系统仅允许 SELECT (硬性约束1)\"}"
+    },
+    {
+      "id": "S03",
+      "title": "BI-DROP被拦",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "sql_safety",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"最终SQL未通过安全校验: 检测到写类操作, 系统仅允许 SELECT (硬性约束1)\"}"
+    },
+    {
+      "id": "S04",
+      "title": "HR-ALTER被拦",
+      "backend": "hr",
+      "alias": "hr-admin",
+      "category": "sql_safety",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"拒绝: 仅允许 SELECT 查询(写类操作被禁止)\"}"
+    },
+    {
+      "id": "S05",
+      "title": "BI-INSERT被拦",
+      "backend": "bi",
+      "alias": "bi-admin",
+      "category": "sql_safety",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"最终SQL未通过安全校验: 检测到写类操作, 系统仅允许 SELECT (硬性约束1)\"}"
+    },
+    {
+      "id": "S06",
+      "title": "HR-堆叠注入第二句被拦",
+      "backend": "hr",
+      "alias": "hr-admin",
+      "category": "sql_safety",
+      "outcome": "PASS",
+      "note": "",
+      "detail": "{\"ok\": true, \"status\": \"denied\", \"reason\": \"语法校验失败: 仅允许单条SQL\"}"
+    }
+  ],
+  "stats": {
+    "total": 47,
+    "passed": 47,
+    "by_cat": {
+      "normal": {
+        "n": 11,
+        "passed": 11
+      },
+      "ambiguous": {
+        "n": 7,
+        "passed": 7
+      },
+      "conflict": {
+        "n": 4,
+        "passed": 4
+      },
+      "authorization": {
+        "n": 8,
+        "passed": 8
+      },
+      "prompt_inject": {
+        "n": 6,
+        "passed": 6
+      },
+      "abnormal": {
+        "n": 5,
+        "passed": 5
+      },
+      "sql_safety": {
+        "n": 6,
+        "passed": 6
+      }
+    },
+    "auto_total": 47,
+    "auto_pass": 47,
+    "auto_fail": 0,
+    "auto_rate": "100.0%"
+  }
+}

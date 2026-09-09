@@ -1,0 +1,27 @@
+# dsh 用户层补丁模板: 同时挂接两个 MCP 业务后端(平台化问数演示)
+# setup.ps1 会把下面的 {{ROOT}} 占位替换成实际解压根, 生成 .runtime\dsh-cordis.generated.yml 后再传给
+#   pnpm dsh web --patch <生成的补丁>
+# 工具名 = mcp__<serverName>__<tool>, 例如 mcp__bi_workbench__prepare_query
+- insert:
+    - id: mcp-bi-workbench
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: bi_workbench
+        transport: stdio
+        command: {{ROOT}}/bi_workbench/.venv/Scripts/python.exe
+        args:
+          - {{ROOT}}/bi_workbench/run_server.py
+        cwd: {{ROOT}}/bi_workbench
+        failOnStartupError: true
+
+    - id: mcp-hr-backend
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: hr_backend
+        transport: stdio
+        command: {{ROOT}}/bi_workbench/.venv/Scripts/python.exe
+        args:
+          - -m
+          - hr_backend.server
+        cwd: {{ROOT}}
+        failOnStartupError: true

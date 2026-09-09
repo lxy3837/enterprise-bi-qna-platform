@@ -1,0 +1,101 @@
+# `enterprise-qna` agent preset: 在 `minimal`（持久 shell + str_replace_editor）基础上，
+# 追加 dsh skill 提供方与加载器，使模型能收到 skill 目录并通过 `skill` 工具加载本地 skill
+# （如用户级 ~/.dsh/skills/enterprise-qna，负责 bi_workbench / hr_backend 的问数接入字典）。
+# skill 注册表在 host 层；此处两行注册进本 preset 的 scope 层，无需 realm。
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: You are a helpful software engineer assistant.
+    complete: false
+    includeRuntimeContext: false
+
+- id: persistent-shell
+  name: cordis:group
+  group: true
+  isolate:
+    terminals: true
+  config:
+    - id: pty
+      name: '@deepseek-ai/dsh-terminal'
+
+    - id: terminal-bash
+      name: '@deepseek-ai/dsh-terminal-bash'
+      disabled: !!js process.platform === 'win32'
+      config:
+        timeoutMs: 300000
+
+    - id: persistent-bash
+      name: '@deepseek-ai/dsh-tool-bash-persistent'
+      disabled: !!js process.platform === 'win32'
+      config:
+        timeoutMs: 300000
+        description: |-
+          Run commands in a bash shell
+          * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+          * You don't have access to the internet via this tool.
+          * You do have access to a mirror of common linux and python packages via apt and pip.
+          * State is persistent across command calls and discussions with the user.
+          * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
+          * Please avoid commands that may produce a very large amount of output.
+          * Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
+
+    - id: terminal-pwsh
+      name: '@deepseek-ai/dsh-terminal-bash'
+      disabled: !!js process.platform !== 'win32'
+      config:
+        shellDialect: pwsh
+        timeoutMs: 300000
+
+    - id: persistent-pwsh
+      name: '@deepseek-ai/dsh-tool-pwsh-persistent'
+      disabled: !!js process.platform !== 'win32'
+      config:
+        timeoutMs: 300000
+        description: |-
+          Run commands in a PowerShell shell
+          * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+          * You don't have access to the internet via this tool.
+          * You do have access to a mirror of common linux and python packages via apt and pip.
+          * State is persistent across command calls and discussions with the user.
+          * Use native Windows paths (C:\...) and $env:NAME variables; this is PowerShell, not bash.
+          * Please avoid commands that may produce a very large amount of output.
+          * Please run long lived commands in the background, e.g. 'Start-Job' or start a server with Start-Process.
+
+- id: filesystem
+  name: cordis:group
+  group: true
+  isolate:
+    fs: true
+  config:
+    - id: fs-local
+      name: '@deepseek-ai/dsh-fs-local'
+      config:
+        cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+    - id: str-replace-editor
+      name: '@deepseek-ai/dsh-tool-str-replace-editor'
+      config:
+        maxOutputChars: 16000
+
+# ── skills ──────────────────────────────────────────────────────────────────
+# 让本 preset 的 agent 拥有 skill 目录与 `skill` 加载工具（本地根扫描由
+# dsh-skill-filesystem 提供，默认含 <projectRoot>/.dsh/skills 与 <dshHome>/skills）。
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+# ── 提问 ────────────────────────────────────────────────────────────────────
+# dsh 自带提问板块：需要用户确认/选择时用 ask_user_question 渲染 UI 组件，
+# 而不是用普通文本发问。
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+# ── 界面渲染 ────────────────────────────────────────────────────────────────
+# genui(OpenTiny 体系): 会在此 preset 的会话启动时注入 schemaJson 生成规则，
+# 让模型能输出 ```schemaJson 围栏，由 web 客户端渲染成可交互卡片/图表/表单。
+# 包随 web profile 安装（dsh plugin add dsh-genui）；此处挂进 agent 组合。
+- id: genui
+  name: dsh-genui
