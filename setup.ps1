@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.6.3 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.6.4 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -15,6 +15,8 @@
 #                      ROOT 定位兼容两种启动方式(-File 与 scriptblock), 避免 Path 为空崩溃;
 #                      git clone 的 stderr 进度不再用 2>&1 合并(PS5.1 + EAP=Stop 会误判为
 #                      NativeCommandError 逐行中断), 改为降 EAP + 看 $LASTEXITCODE
+#                v2.6.4: pnpm install 增加窗口顶部进度条 —— 百分比按 store 下载字节/预估 1.5GB,
+#                      解析阶段自动转圈; 后台 node 直跑 pnpm + 日志轮询, 找不到真实入口时自动降级前台直跑
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -313,6 +315,109 @@ function Start-DshPortal {
     }
 }
 
+# 带进度条执行 pnpm install: 后台用 node 直跑 pnpm(绕过 .cmd 包装以便重定向+轮询),
+# 窗口顶部 Write-Progress 展示进度 —— 百分比取 pnpm store 增量字节/预估 1.5GB;
+# 尚未真正开始下载时进度条转圈(解析阶段可能静默数分钟, 属正常)。
+# 找不到 pnpm 真实 js 入口时自动降级为前台直跑(保留原有行为)。
+# 返回 $true=成功 / $false=失败(失败时已打印错误日志尾部)。
+function Invoke-PnpmInstallProgress {
+    param([string]$WorkDir, [string]$PnpmCmd, [string]$NodeExe, [string]$Label,
+          [string]$ErrHint = "可重跑本脚本, 或手动: cd '$WorkDir' ; pnpm install")
+    $logDir = Join-Path $RUNTIME "logs"
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $o = Join-Path $logDir "pnpm-install.out.log"
+    $e = Join-Path $logDir "pnpm-install.err.log"
+    Remove-Item $o, $e -Force -ErrorAction SilentlyContinue
+    $js = $null
+    if ($PnpmCmd) {
+        $wrapDir = Split-Path $PnpmCmd
+        # 候选1: npm 全局安装布局  <prefix>\node_modules\pnpm\bin\pnpm.cjs
+        $c1 = Join-Path $wrapDir "node_modules\pnpm\bin\pnpm.cjs"
+        if (Test-Path $c1) { $js = $c1 }
+        if (-not $js) {
+            # 候选2: corepack shim 布局  <nodejs>\node_modules\corepack\dist\pnpm.js
+            # (pnpm.ps1/.cmd 与 corepack 同目录; node 直跑该文件 = 执行 corepack pnpm,
+            #  会按工程 packageManager 字段自动选用正确版本, 与命令行 pnpm 完全等价)
+            $c2 = Join-Path $wrapDir "node_modules\corepack\dist\pnpm.js"
+            if (Test-Path $c2) { $js = $c2 }
+        }
+    }
+    if (-not $js -or -not $NodeExe) {
+        # 兜底: 前台直跑, pnpm 自带的进度仍直接显示
+        Push-Location $WorkDir
+        try { & $PnpmCmd install --no-frozen-lockfile; return ($LASTEXITCODE -eq 0) }
+        finally { Pop-Location }
+    }
+    Warn "$Label (进度条在窗口顶部, 请保持联网; 详细日志: $o)"
+    # 下载落盘处 = pnpm store; 另加 node_modules\.pnpm(部分场景 store 在别处)
+    $storeDir = Join-Path $env:LOCALAPPDATA "pnpm\store"
+    $measDirs = @($storeDir, (Join-Path $WorkDir "node_modules\.pnpm"))
+    $size0 = 0
+    foreach ($m in $measDirs) { if (Test-Path $m) { $size0 += @(Get-ChildItem -LiteralPath $m -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum } }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $proc = Start-Process -FilePath $NodeExe -ArgumentList @($js, 'install', '--no-frozen-lockfile') -WorkingDirectory $WorkDir -RedirectStandardOutput $o -RedirectStandardError $e -NoNewWindow -PassThru
+    $lastOut = 0; $spin = 0; $tick = 0; $echoN = 0
+    while (-not $proc.HasExited) {
+        Start-Sleep -Milliseconds 900
+        $spin++; $tick++
+        # 回显 pnpm 的生命期/警告行(Progress 计行交给进度条, 避免刷屏)
+        if (Test-Path $o) {
+            $all = Get-Content -LiteralPath $o -Raw -ErrorAction SilentlyContinue
+            if ($all -and $all.Length -gt $lastOut) {
+                ($all.Substring($lastOut)) -split "\r?\n" | ForEach-Object {
+                    if ($_ -and $_ -notmatch '^\s*$' -and $_ -notmatch 'Progress:' -and $_ -match 'WARN|ERR|Packages:|added|Done in|Already up|Unsupported|deprecat|vulnerab|Ignored build') {
+                        $echoN++
+                        if ($echoN -le 60) { Write-Host ("    " + $_) -ForegroundColor DarkGray }
+                    }
+                }
+                $lastOut = $all.Length
+            }
+        }
+        # 每 3 tick 量一次体积(递归枚举大目录较费 IO)
+        $mb = 0
+        if ($tick % 3 -eq 0) {
+            $now = 0
+            foreach ($m in $measDirs) { if (Test-Path $m) { $now += @(Get-ChildItem -LiteralPath $m -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum } }
+            $mb = [math]::Round(($now - $size0) / 1MB, 0)
+        }
+        $secs = [int]$sw.Elapsed.TotalSeconds
+        $real = [int][math]::Min(99.0, $mb / (1.5 * 1024) * 100.0)   # 全新安装约 1.5GB
+        if ($real -ge 1) {
+            Write-Progress -Activity $Label -Status ("已下载约 {0} MB / 预估 1.5 GB | 已用时 {1}m{2}s" -f $mb, [int]($secs/60), ($secs%60)) -PercentComplete $real
+        } else {
+            Write-Progress -Activity $Label -Status ("解析依赖/连接源中(此阶段下载量常为 0, 属正常) | 已用时 {0}m{1}s" -f [int]($secs/60), ($secs%60)) -PercentComplete ($spin % 100)
+        }
+    }
+    $proc.WaitForExit()   # 确保输出管道/句柄全部关闭后再判定
+    # 退出码获取: 多数宿主 WaitForExit 后能同步到子进程退出码; 个别宿主
+    # (如部分 PS5.1 环境)即使 HasExited/WaitForExit 后该属性仍为 $null ——
+    # 不能据此判失败, 交由下方"产物+日志"兜底复核
+    $code = -1
+    try { if ($proc.ExitCode -is [int]) { $code = $proc.ExitCode } } catch { }
+    Write-Progress -Activity $Label -Completed
+    if ($code -ne 0) {
+        # 兜底复核(仅当退出码拿不到即 -1 时启用): 一次成功的 pnpm install 必然
+        # 生成 node_modules 产物、stdout/stderr 出现 "Done in ..." 完成行, 且不含致命错误;
+        # 失败的安装通常无成熟产物或日志带致命错误标记 -> 据此避免误报失败
+        if ($code -eq -1) {
+            $mod = Join-Path $WorkDir "node_modules"
+            $modOk = (Test-Path $mod) -and (@(Get-ChildItem -LiteralPath $mod -Force -ErrorAction SilentlyContinue).Count -gt 0)
+            $allTxt = ""
+            foreach ($f in @($o, $e)) { if (Test-Path $f) { $allTxt += (Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue) } }
+            $doneOK = $allTxt -match "Done in \d"
+            $fatal  = $allTxt -match "(?i)(ELIFECYCLE|ERR_PNPM_|Command failed|EINTEGRITY|ETIMEDOUT|EAI_AGAIN|ENOSPC|EPERM|EACCES|ENOTEMPTY|FetchError|npm error)"
+            if ($modOk -and $doneOK -and -not $fatal) { $code = 0 }
+        }
+    }
+    if ($code -ne 0) {
+        Err "pnpm install 失败(退出码 $code)。错误日志尾部:"
+        if (Test-Path $e) { Get-Content -LiteralPath $e -Tail 25 | ForEach-Object { Write-Host ("    " + $_) -ForegroundColor DarkYellow } }
+        Err $ErrHint
+        return $false
+    }
+    return $true
+}
+
 # 确保 dsh 门户运行时(deepseek-harness)就绪: 缺源码时按需联网获取(git 浅克隆或官方 zip),
 # 缺 node_modules 时自动 pnpm install。该引擎是第三方上游工程(源码数百 MB + 依赖≈1.5GB),
 # 为控制仓库体积未内置; 等价宿主/评测不需要它。
@@ -380,12 +485,10 @@ function Invoke-HarnessBootstrap {
     $pnpm = Ensure-Pnpm $nodeExe
     if (-not $pnpm) { Err "pnpm 安装失败, 请手动执行 npm install -g pnpm 后重跑"; return $false }
     Ok "node $(& $nodeExe --version 2>$null) / pnpm $(& $pnpm --version 2>$null)"
-    Push-Location $h
-    try {
-        Warn "执行 pnpm install (联网拉取依赖) ..."
-        & $pnpm install --no-frozen-lockfile
-        if ($LASTEXITCODE -ne 0) { Err "pnpm install 失败(见上方输出)。可重跑本脚本或手动: cd '$h' ; pnpm install"; return $false }
-    } finally { Pop-Location }
+    if (-not (Invoke-PnpmInstallProgress -WorkDir $h -PnpmCmd $pnpm -NodeExe $nodeExe -Label "deepseek-harness 依赖安装 (pnpm install)")) {
+        Err "deepseek-harness 依赖安装失败, 门户暂不可启动(等价宿主/评测不受影响)。可重跑本脚本或手动: cd '$h' ; pnpm install"
+        return $false
+    }
     Ok "deepseek-harness 依赖安装完成。选 [F] 即可一键启动门户并自动打开浏览器"
     return $true
 }
