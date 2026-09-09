@@ -12,7 +12,9 @@
 #                      (PS5.1 丢弃空字符串参数) -> 改传 "--password=<值>" 单 token; 简化便携实例密码询问
 #                v2.6.3: 缺 deepseek-harness 源码/依赖时, 3/6 与菜单 [F]/[D] 自动联网获取
 #                      (git 浅克隆或官方 zip) 并 pnpm install, 不再报错要求手动装;
-#                      ROOT 定位兼容两种启动方式(-File 与 scriptblock), 避免 Path 为空崩溃
+#                      ROOT 定位兼容两种启动方式(-File 与 scriptblock), 避免 Path 为空崩溃;
+#                      git clone 的 stderr 进度不再用 2>&1 合并(PS5.1 + EAP=Stop 会误判为
+#                      NativeCommandError 逐行中断), 改为降 EAP + 看 $LASTEXITCODE
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -338,8 +340,21 @@ function Invoke-HarnessBootstrap {
         $branch   = if ($env:HARNESS_BRANCH) { $env:HARNESS_BRANCH } else { "master" }
         $git = (Get-Command git -ErrorAction SilentlyContinue).Source
         if ($git) {
-            Warn "自动克隆 deepseek-harness($branch, 浅克隆, 联网下载源码)..."
-            & $git clone --depth 1 --branch $branch "$repoBase.git" $h 2>&1 | Out-Null
+            # 上次中断(如 clone 途中被 NativeCommandError 打断)会留下残缺目录, 先清掉再克隆
+            if (Test-Path $h) {
+                Warn "检测到残留的 deepseek-harness 目录(无 package.json), 清理后重新获取 ..."
+                try { Remove-Item $h -Recurse -Force -ErrorAction Stop }
+                catch { Err "残留目录无法删除($h), 请手动删除后重试"; return $false }
+            }
+            Warn "自动克隆 deepseek-harness($branch, 浅克隆, 联网下载源码; 进度显示在本窗口) ..."
+            # PS5.1 陷阱(同 mysqld 初始化): git 的进度信息走 stderr, 若用 2>&1 合并进管道,
+            # 在 EAP=Stop 下每条 stderr 都会被当成 NativeCommandError 致命错误逐行中断。
+            # 解决: 不合并 stderr(直接上屏), 调用期临时把 EAP 降为 Continue, 成败只看退出码。
+            $eapSave = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+            & $git clone --depth 1 --branch $branch "$repoBase.git" $h
+            $cloneCode = $LASTEXITCODE
+            $ErrorActionPreference = $eapSave
+            if ($cloneCode -ne 0) { Err "git clone 失败(退出码 $cloneCode), 请检查网络/代理后重试"; return $false }
         } else {
             Warn "未检测到 git, 改为直接下载官方 zip 并解压..."
             $zip = Join-Path $RUNTIME "deepseek-harness.zip"
