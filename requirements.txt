@@ -1,5 +1,5 @@
-# 平台化企业智能问数工作台 — Python 依赖锁定（对齐 .venv 实测版本）
-# 用法: python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
+# Platform BI Q&A workbench - Python dependency lock (aligned with tested .venv versions)
+# Usage: python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
 fastmcp==2.14.7
 mcp==1.30.0
 pymysql==1.2.0
