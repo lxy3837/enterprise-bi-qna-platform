@@ -69,6 +69,11 @@
 #                      现在 Ensure-Pnpm 接受上游 pin: 读 package.json 的 packageManager,
 #                      现有 pnpm 不匹配就换装同版本(pnpm@12 的机器会自动降到 11.7.0);
 #                      harness 的依赖安装、构建、以及 [D] 前台启动(pnpm run dsh)都带这个 pin
+#                v2.7.5: 修复"git pull 拉到新前端, 门户却还是旧界面" —— 构建就绪判定增加
+#                      源码新鲜度检查: 构建输入目录(apps/packages/vendor/native/scripts +
+#                      根构建配置)里任何文件比 .dsh-build 构建记录新, 就判定产物过期并自动
+#                      重建(2 秒容差)。配合 harness 源码(含企业定制, 基线 0.1.3-alpha.1)
+#                      已随主仓库分发: 新机器 clone 后源码即在, 不再从官方上游拉原版
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -393,8 +398,8 @@ function Start-DshPortal {
         return
     }
     if (-not (Test-HarnessBuilt $Harness)) {
-        Err "deepseek-harness 尚未构建(缺各包 lib\*.js 或 apps\web\dist), 无法启动门户。"
-        Err "现在强行启动只会看到 plugin degraded (import) 与 client bundles not found;"
+        Err "deepseek-harness 未构建或构建产物已过期(缺各包 lib\*.js/apps\web\dist, 或源码比产物新), 无法启动门户。"
+        Err "现在强行启动只会看到 plugin degraded (import) 与 client bundles not found, 或加载到旧界面;"
         Err "选 [F]/[D] 或重跑 setup.bat -Product 会自动构建; 也可手动: cd '$Harness' ; pnpm run build"
         return
     }
@@ -794,12 +799,43 @@ function Test-HarnessReady([string]$Harness) {
 #   2) failed to apply loader entry modules: client-modules: 45 client packages failed to compose:
 #      client bundles not found; run `pnpm run build` before launch
 # 判定取样 5 处(上游自己的构建记录 + host/client/web 三侧代表产物), 毫秒级, 不遍历全仓。
+# 构建输入的最新修改时间(UTC): 用于识别"源码更新了但产物还是旧的"(典型场景: git pull
+# 拉到新的前端定制后, lib/dist 仍是上次构建的版本 -> 门户显示旧界面)。
+# 只扫参与构建的目录, 且排除依赖/产物/缓存, 避免 pnpm install 触碰 node_modules 误触发。
+function Get-HarnessSourceStamp([string]$Harness) {
+    $skip = '\\(node_modules|lib|dist|\.dsh-build|coverage|\.artifacts|\.worktrees|worktrees|\.pnpm-store|\.cache)(\\|$)'
+    $dirs = @('apps', 'packages', 'vendor', 'native', 'scripts', 'patches')
+    $newest = [datetime]::MinValue
+    foreach ($d in $dirs) {
+        $p = Join-Path $Harness $d
+        if (-not (Test-Path $p)) { continue }
+        foreach ($f in (Get-ChildItem -LiteralPath $p -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+            if ($f.FullName -match $skip) { continue }
+            if ($f.Extension -eq '.tsbuildinfo') { continue }
+            if ($f.LastWriteTimeUtc -gt $newest) { $newest = $f.LastWriteTimeUtc }
+        }
+    }
+    # 根目录的构建配置也是输入
+    foreach ($pat in @('tsconfig*.json', 'tsdown.config.ts', 'package.json', 'pnpm-workspace.yaml')) {
+        foreach ($f in (Get-ChildItem -LiteralPath $Harness -Filter $pat -File -Force -ErrorAction SilentlyContinue)) {
+            if ($f.LastWriteTimeUtc -gt $newest) { $newest = $f.LastWriteTimeUtc }
+        }
+    }
+    return $newest
+}
+
 function Test-HarnessBuilt([string]$Harness) {
-    if (-not (Test-Path (Join-Path $Harness ".dsh-build\client-build-environment.json"))) { return $false }
+    $rec = Join-Path $Harness ".dsh-build\client-build-environment.json"
+    if (-not (Test-Path $rec)) { return $false }
     if (-not (Test-Path (Join-Path $Harness "apps\web\dist\index.html"))) { return $false }
     if (-not (Test-Path (Join-Path $Harness "vendor\cordis\lib\index.js"))) { return $false }
     if (-not (Test-Path (Join-Path $Harness "packages\settings\settings\lib\index.js"))) { return $false }
     if (-not (Test-Path (Join-Path $Harness "packages\client\modules\lib\client.js"))) { return $false }
+    # 新鲜度: 构建输入比构建记录新 = 产物过期(git pull 更新过源码/定制), 必须重建,
+    # 否则门户加载的还是旧 lib/dist。2 秒容差防止同批次写入的时间差误判。
+    try {
+        if ((Get-HarnessSourceStamp $Harness) -gt ((Get-Item $rec).LastWriteTimeUtc.AddSeconds(2))) { return $false }
+    } catch { }
     return $true
 }
 
@@ -847,10 +883,14 @@ function Show-LogDiagnostics {
 function Invoke-HarnessBuild {
     param([string]$Harness)
     if (Test-HarnessBuilt $Harness) {
-        Ok "deepseek-harness 构建产物已就绪(各包 lib + apps/web/dist), 跳过构建"
+        Ok "deepseek-harness 构建产物已就绪(各包 lib + apps/web/dist, 且与源码同步), 跳过构建"
         return $true
     }
-    Warn "deepseek-harness 尚未构建(缺各包 lib\*.js / lib\client.js / apps\web\dist)。"
+    if (Test-Path (Join-Path $Harness ".dsh-build\client-build-environment.json")) {
+        Warn "deepseek-harness 源码比构建产物新(检测到前端/源码更新, 旧 lib/dist 已过期), 重新构建以避免门户显示旧界面 ..."
+    } else {
+        Warn "deepseek-harness 尚未构建(缺各包 lib\*.js / lib\client.js / apps\web\dist)。"
+    }
     Warn "不构建直接启动门户会报 plugin degraded / client bundles not found; 现在开始构建(纯本地编译, 首次约 3-10 分钟) ..."
     $nodeExe = Ensure-NodeRuntime
     if (-not $nodeExe) { Err "node 不可用, 无法构建门户运行时"; return $false }
