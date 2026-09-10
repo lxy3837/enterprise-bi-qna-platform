@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.6.7 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.6.8 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -31,6 +31,10 @@
 #                      解析/等待阶段改用不确定进度(-1), 不再用"百分比在动而计数为 0"的假进度;
 #                      30 秒无任何 pnpm 事件时明确提示"可能在下载 pnpm 版本/等待网络";
 #                      子进程 stdin 改指空文件(corepack 仅在 stdin 为 TTY 时询问), 双重保险
+#                v2.6.8: 增加 pnpm 安装"静默卡死看门狗" —— 连续 60 秒收不到任何输出(stdout+stderr)
+#                      即判定卡死, 自动终止进程树并明确报错(给出可能原因与放宽方法);
+#                      慢网络可用 DSH_SETUP_PNPM_STALL_SECS 放宽(秒)或设 0 关闭;
+#                      日志里出现 corepack 的 "[Y/n]" 询问时直接点名"等不到回车"
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -398,10 +402,15 @@ function Invoke-PnpmInstallProgress {
     }
     $useNdjson = $true     # 真进度开关; 老 pnpm 不认该参数时置 $false 重跑
     $summarySeen = $false  # ndjson 模式下 "安装完成汇总" 是否出现(成功兜底判据)
+    # 静默卡死看门狗阈值: 连续 N 秒收不到任何输出(stdout+stderr)即判定卡死并自动终止。
+    # 默认 60 秒; 慢网络可用环境变量 DSH_SETUP_PNPM_STALL_SECS 放宽(秒), 设 0 关闭看门狗。
+    $stallSecs = 60
+    if ($env:DSH_SETUP_PNPM_STALL_SECS -match '^\d+$') { $stallSecs = [int]$env:DSH_SETUP_PNPM_STALL_SECS }
     $attempt = 0
     $code = -1
     while ($true) {
         $attempt++
+        $killed = $false; $promptSeen = $null   # 每次尝试都重置看门狗状态
         Remove-Item $o, $e -Force -ErrorAction SilentlyContinue
         $pnpmArgs = @($js, 'install', '--no-frozen-lockfile')
         if ($useNdjson) { $pnpmArgs += '--reporter=ndjson' }
@@ -422,6 +431,7 @@ function Invoke-PnpmInstallProgress {
         $imported = New-Object 'System.Collections.Generic.HashSet[string]'
         $lastOut = 0; $lastErr = 0; $spin = 0; $tick = 0; $echoN = 0
         $stage = ''; $lastGrowAt = 0.0; $gotAnyEvent = $false   # 真实阶段 / 日志最后增长时刻 / 是否收到过任何 pnpm 事件
+        $lastAny = 0.0   # 最近一次"子进程有输出(stdout 或 stderr)"的时刻, 供静默看门狗判定
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $proc = Start-Process -FilePath $NodeExe -ArgumentList $pnpmArgs -WorkingDirectory $WorkDir -RedirectStandardOutput $o -RedirectStandardError $e -RedirectStandardInput $in0 -NoNewWindow -PassThru
         while (-not $proc.HasExited) {
@@ -433,11 +443,14 @@ function Invoke-PnpmInstallProgress {
                 if ($allE -and $allE.Length -gt $lastErr) {
                     ($allE.Substring($lastErr)) -split "\r?\n" | ForEach-Object {
                         if ($_ -and $_ -notmatch '^\s*$') {
+                            # corepack 交互询问(等不到回车): 记录下来, 看门狗报错时直接点名原因
+                            if (-not $promptSeen -and $_ -match '(?i)(\[Y/n\]|Do you want to continue)') { $promptSeen = $_.Trim() }
                             $echoN++
                             if ($echoN -le 60) { Write-Host ("    [stderr] " + $_) -ForegroundColor DarkYellow }
                         }
                     }
                     $lastErr = $allE.Length
+                    $lastAny = $sw.Elapsed.TotalSeconds
                 }
             }
             # 增量读 stdout: ndjson 模式解析进度事件; 文本模式回显 pnpm 生命期/警告行
@@ -484,14 +497,37 @@ function Invoke-PnpmInstallProgress {
                     }
                     $lastOut = $all.Length
                     $lastGrowAt = $sw.Elapsed.TotalSeconds
+                    $lastAny = $lastGrowAt
                 }
             }
             $secs = [int]$sw.Elapsed.TotalSeconds
+            # 静默卡死看门狗: 连续 N 秒没有任何输出(stdout+stderr)即判定卡死 -> 终止整棵进程树并明确报错。
+            # 之所以要有它: 后台重定向下 pnpm/corepack 一旦在等交互确认或网络挂起, 是"进度条一直转、
+            # 计数永远是 0"的假象, 不干预能把一次安装拖成一小时(见文件头 v2.6.7 / v2.6.8 说明)。
+            $quiet = $sw.Elapsed.TotalSeconds - $lastAny
+            if ($stallSecs -gt 0 -and $quiet -ge $stallSecs) {
+                $killed = $true
+                Write-Progress -Activity $Label -Completed
+                if ($promptSeen) {
+                    Err ("pnpm/corepack 在等待交互确认(已卡 {0} 秒), 后台运行无法输入回车 -> 已自动终止。提示内容: {1}" -f $secs, $promptSeen)
+                    Err "请确认使用的是含 v2.6.7+ 修复的 setup.ps1(COREPACK_ENABLE_DOWNLOAD_PROMPT=0 + stdin 重定向)后重跑。"
+                } else {
+                    Err ("pnpm 已连续 {0} 秒无任何输出(stdout+stderr), 判定卡死 -> 已自动终止。" -f $secs)
+                    Err "常见原因: corepack 下载 pnpm 版本挂起 / 网络不通 / npm 源不可达。"
+                }
+                Err '确属慢网络可放宽或关闭看门狗后重跑: $env:DSH_SETUP_PNPM_STALL_SECS="300" (设 0 关闭)'
+                # 杀整棵进程树(node -> corepack -> 真实 pnpm): 只杀父进程会留下孤儿进程继续占磁盘/端口
+                try { Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\taskkill.exe') -ArgumentList @('/PID', $proc.Id, '/T', '/F') -NoNewWindow -Wait -ErrorAction SilentlyContinue } catch { }
+                try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+                break
+            }
             # "日志长时间无新增" 提示: 用来区分"在慢慢跑"与"真的卡死"
             $idleTip = ''
             if ($lastGrowAt -gt 0 -and ($sw.Elapsed.TotalSeconds - $lastGrowAt) -gt 240) {
                 $idleTip = ("（日志已 {0} 分钟无输出, 可能在等网络/源较慢）" -f [int](($sw.Elapsed.TotalSeconds - $lastGrowAt) / 60))
             }
+            $wdTip = ''
+            if ($stallSecs -gt 0) { $wdTip = ("（连续 {0} 秒无输出将自动中止并报错, 可用 DSH_SETUP_PNPM_STALL_SECS 放宽）" -f $stallSecs) }
             $stageTxt = switch ($stage) {
                 'resolution_started' { '解析依赖中: ' }
                 'resolution_done'    { '下载依赖中: ' }
@@ -509,7 +545,7 @@ function Invoke-PnpmInstallProgress {
                     Write-Progress -Activity $Label -Status ("{0}依赖包 {1}/{2}（已下载 {3} · 已链接 {4}）{5}| 已用时 {6}m{7}s" -f $stageTxt, $done, $tot, $got, $imp, $idleTip, [int]($secs/60), ($secs%60)) -PercentComplete $pct
                 } elseif (-not $gotAnyEvent -and $secs -ge 30) {
                     # 30s 没有任何 pnpm 事件: 多半 corepack 正在下 pnpm 版本 / 网络不通, 而不是在解析
-                    Write-Progress -Activity $Label -Status ("pnpm 尚未开始输出（可能在下载 pnpm 版本或等待网络, 见下方 [stderr] 与日志）| 已用时 {0}m{1}s" -f [int]($secs/60), ($secs%60)) -PercentComplete -1
+                    Write-Progress -Activity $Label -Status ("pnpm 尚未开始输出（可能在下载 pnpm 版本或等待网络, 见下方 [stderr] 与日志）{0}| 已用时 {1}m{2}s" -f $wdTip, [int]($secs/60), ($secs%60)) -PercentComplete -1
                 } else {
                     # 解析阶段总量未知: 用不确定进度(-1), 避免"百分比在动但计数为 0"的误导
                     Write-Progress -Activity $Label -Status ("{0}已解析 {1} 个包（pnpm 解析大工程较久, 静默属正常）{2}| 已用时 {3}m{4}s" -f $stageTxt, $tot, $idleTip, [int]($secs/60), ($secs%60)) -PercentComplete -1
@@ -526,7 +562,7 @@ function Invoke-PnpmInstallProgress {
                 if ($real -ge 1) {
                     Write-Progress -Activity $Label -Status ("已下载约 {0} MB / 预估 1.5 GB | 已用时 {1}m{2}s" -f $mb, [int]($secs/60), ($secs%60)) -PercentComplete $real
                 } else {
-                    Write-Progress -Activity $Label -Status ("解析依赖/连接源中(此阶段下载量常为 0, 属正常){0}| 已用时 {1}m{2}s" -f $idleTip, [int]($secs/60), ($secs%60)) -PercentComplete -1
+                    Write-Progress -Activity $Label -Status ("解析依赖/连接源中(此阶段下载量常为 0, 属正常){0}{1}| 已用时 {2}m{3}s" -f $idleTip, $wdTip, [int]($secs/60), ($secs%60)) -PercentComplete -1
                 }
             }
         }
@@ -536,6 +572,12 @@ function Invoke-PnpmInstallProgress {
         # 不能据此判失败, 交由下方"产物+日志"兜底复核
         try { if ($proc.ExitCode -is [int]) { $code = $proc.ExitCode } } catch { }
         Write-Progress -Activity $Label -Completed
+        # 看门狗已主动终止: 产物必然残缺, 不能再走"失败兜底复核"(会误判为成功), 直接判失败返回
+        if ($killed) {
+            Err "pnpm install 已由看门狗中止, 本次安装未完成。日志: $o"
+            Err $ErrHint
+            return $false
+        }
         # 参数兼容: 老 pnpm 不认 --reporter=ndjson 时会立即报错退出 -> 去掉参数重跑一次(转体积估算)
         if ($useNdjson -and $attempt -eq 1 -and $code -ne 0 -and $sw.Elapsed.TotalSeconds -lt 30) {
             $txt = ""
