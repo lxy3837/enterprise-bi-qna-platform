@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.6.9 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.7.0 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -38,6 +38,13 @@
 #                v2.6.9: 折叠 pnpm 两类"已知无害"告警(上游 monorepo 包成环 / 非本平台的可选
 #                      二进制被跳过, 如 lightningcss-android-arm64), 每类只留一行灰字说明,
 #                      不再占据日志配额、也不再看着像报错; 设 DSH_SETUP_VERBOSE=1 可看原文
+#                v2.7.0: 门户就绪判定不再只看 node_modules 目录是否存在 —— 上次安装被中断会留下
+#                      不完整目录, 启动 dsh web 直接报 ERR_MODULE_NOT_FOUND 'tsx'; 现在改为
+#                      校验启动命令真正依赖的 node_modules\tsx 与 apps\cli\src\bin.ts,
+#                      不完整则自动重新 pnpm install(而不是"跳过安装"后启动失败);
+#                      看门狗阈值按阶段放宽(解析 600s / 下载链接 300s), 避免把"正常但安静"的
+#                      安装误杀成残缺目录; 环境识别与启动用的 node 判定统一(都认 .runtime 便携版),
+#                      不再出现"前面说没检测到 node, 后面却用着 v24.x 便携版"的矛盾提示
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -285,8 +292,9 @@ function Start-DshPortal {
             }
         }
     }
-    if (-not (Test-Path (Join-Path $Harness "node_modules"))) {
-        Err "deepseek-harness 依赖未安装, 无法启动门户。请先完整执行本脚本 3/6 或手动 cd '$Harness' 后 pnpm install"
+    if (-not (Test-HarnessReady $Harness)) {
+        Err "deepseek-harness 依赖不完整(缺 node_modules 或不含 tsx), 无法启动门户。"
+        Err "选 [F] 或重跑 setup.bat -Product 会自动补齐依赖; 也可手动: cd '$Harness' ; pnpm install"
         return
     }
     $nodeExe = Ensure-NodeRuntime
@@ -528,15 +536,24 @@ function Invoke-PnpmInstallProgress {
             # 静默卡死看门狗: 连续 N 秒没有任何输出(stdout+stderr)即判定卡死 -> 终止整棵进程树并明确报错。
             # 之所以要有它: 后台重定向下 pnpm/corepack 一旦在等交互确认或网络挂起, 是"进度条一直转、
             # 计数永远是 0"的假象, 不干预能把一次安装拖成一小时(见文件头 v2.6.7 / v2.6.8 说明)。
+            # 但阈值必须按阶段放宽: pnpm 解析依赖图时会长时间(可能几分钟)不输出任何事件,
+            # 若按 60s 一刀切会误杀"正常但安静"的安装, 反而在磁盘上留下残缺 node_modules
+            # (下次启动门户就报缺 tsx)。所以真正的快速判定只用于"连一条 pnpm 事件都没有"和
+            # "已经抓到 corepack 的 [Y/n] 询问"这两种确定的卡死。
+            $stallLimit = $stallSecs
+            if ($stallSecs -gt 0) {
+                if ($stage -eq 'resolution_started') { $stallLimit = [math]::Max($stallSecs, 600) }
+                elseif ($stage -eq 'resolution_done' -or $stage -eq 'importing_started') { $stallLimit = [math]::Max($stallSecs, 300) }
+            }
             $quiet = $sw.Elapsed.TotalSeconds - $lastAny
-            if ($stallSecs -gt 0 -and $quiet -ge $stallSecs) {
+            if ($promptSeen -or ($stallLimit -gt 0 -and $quiet -ge $stallLimit)) {
                 $killed = $true
                 Write-Progress -Activity $Label -Completed
                 if ($promptSeen) {
-                    Err ("pnpm/corepack 在等待交互确认(已卡 {0} 秒), 后台运行无法输入回车 -> 已自动终止。提示内容: {1}" -f $secs, $promptSeen)
+                    Err ("pnpm/corepack 在等待交互确认(已 {0} 秒无输出), 后台运行无法输入回车 -> 已自动终止。提示内容: {1}" -f [int]$quiet, $promptSeen)
                     Err "请确认使用的是含 v2.6.7+ 修复的 setup.ps1(COREPACK_ENABLE_DOWNLOAD_PROMPT=0 + stdin 重定向)后重跑。"
                 } else {
-                    Err ("pnpm 已连续 {0} 秒无任何输出(stdout+stderr), 判定卡死 -> 已自动终止。" -f $secs)
+                    Err ("pnpm 已连续 {0} 秒无任何输出(stdout+stderr), 判定卡死 -> 已自动终止。" -f [int]$quiet)
                     Err "常见原因: corepack 下载 pnpm 版本挂起 / 网络不通 / npm 源不可达。"
                 }
                 Err '确属慢网络可放宽或关闭看门狗后重跑: $env:DSH_SETUP_PNPM_STALL_SECS="300" (设 0 关闭)'
@@ -551,7 +568,7 @@ function Invoke-PnpmInstallProgress {
                 $idleTip = ("（日志已 {0} 分钟无输出, 可能在等网络/源较慢）" -f [int](($sw.Elapsed.TotalSeconds - $lastGrowAt) / 60))
             }
             $wdTip = ''
-            if ($stallSecs -gt 0) { $wdTip = ("（连续 {0} 秒无输出将自动中止并报错, 可用 DSH_SETUP_PNPM_STALL_SECS 放宽）" -f $stallSecs) }
+            if ($stallLimit -gt 0) { $wdTip = ("（连续 {0} 秒无输出将自动中止并报错, 可用 DSH_SETUP_PNPM_STALL_SECS 放宽）" -f $stallLimit) }
             $stageTxt = switch ($stage) {
                 'resolution_started' { '解析依赖中: ' }
                 'resolution_done'    { '下载依赖中: ' }
@@ -647,6 +664,17 @@ function Invoke-PnpmInstallProgress {
     return $true
 }
 
+# 门户运行时是否"真的"可用 —— 不能只看 node_modules 目录在不在:
+# 上次安装被中断(看门狗终止/手动关窗口)会留下不完整的 node_modules, 之后启动 dsh web
+# 直接报 ERR_MODULE_NOT_FOUND 'tsx'(启动命令是 node --import tsx/esm apps/cli/src/bin.ts)。
+# 这里额外校验启动命令真正依赖的两样东西, 避免"跳过安装"后启动失败。
+function Test-HarnessReady([string]$Harness) {
+    if (-not (Test-Path (Join-Path $Harness "node_modules"))) { return $false }
+    if (-not (Test-Path (Join-Path $Harness "node_modules\tsx"))) { return $false }
+    if (-not (Test-Path (Join-Path $Harness "apps\cli\src\bin.ts"))) { return $false }
+    return $true
+}
+
 # 确保 dsh 门户运行时(deepseek-harness)就绪: 缺源码时按需联网获取(git 浅克隆或官方 zip),
 # 缺 node_modules 时自动 pnpm install。该引擎是第三方上游工程(源码数百 MB + 依赖≈1.5GB),
 # 为控制仓库体积未内置; 等价宿主/评测不需要它。
@@ -656,9 +684,10 @@ function Invoke-HarnessBootstrap {
     $h = Join-Path $ROOT "deepseek-harness"
     $hasSrc = Test-Path (Join-Path $h "package.json")
     $hasMod = Test-Path (Join-Path $h "node_modules")
-    if ($hasSrc -and $hasMod) { Ok "deepseek-harness 依赖已就绪(node_modules 存在), 跳过安装"; return $true }
-    if ($hasSrc -and -not $hasMod) {
-        Warn "deepseek-harness 缺少 node_modules, 开始自动安装门户依赖(需联网, 下载约 1.5GB, 可能 10-20 分钟) ..."
+    if ($hasSrc -and (Test-HarnessReady $h)) { Ok "deepseek-harness 依赖已就绪(node_modules + tsx 校验通过), 跳过安装"; return $true }
+    if ($hasSrc) {
+        if ($hasMod) { Warn "deepseek-harness 的 node_modules 不完整(上次安装被中断?), 重新 pnpm install 补齐 ..." }
+        else { Warn "deepseek-harness 缺少 node_modules, 开始自动安装门户依赖(需联网, 下载约 1.5GB, 可能 10-20 分钟) ..." }
     } else {
         # 源码缺失 -> 询问/自动获取
         if (-not $FetchIfMissing) {
@@ -860,10 +889,18 @@ else {
 }
 
 # --- Node / pnpm (仅 dsh 图形门户需要; 等价宿主/评测不需要) ---
-$nodeOk = [bool](Get-Command node -ErrorAction SilentlyContinue)
+# 与 Ensure-NodeRuntime 保持同一套判定(PATH -> .runtime 便携; 此处只探测不下载),
+# 否则会出现"这里说未检测到 node, 后面却用着 .runtime 里的 v24.x 便携版"的矛盾提示
+$nodeExe0 = (Get-Command node -ErrorAction SilentlyContinue).Source
+$nodeIsPortable = $false
+if (-not $nodeExe0) { $nodeExe0 = Find-PortableNode; if ($nodeExe0) { $nodeIsPortable = $true } }
+if ($nodeExe0) {
+    $nv = (& $nodeExe0 --version 2>$null | Select-Object -First 1)
+    if ($nodeIsPortable) { Ok "node $nv (便携版, 已解压于 .runtime\nodejs)" } else { Ok "node $nv" }
+} else { Warn "未检测到 node(仅 dsh 图形门户需要, 后续会自动下载便携版)" }
 $pnpmOk = [bool](Get-Command pnpm -ErrorAction SilentlyContinue)
-if ($nodeOk) { Ok "node $(node --version 2>$null)" } else { Warn "未检测到 node(仅 dsh 图形门户需要)" }
-if ($pnpmOk) { Ok "pnpm $(pnpm --version 2>$null)" } else { Warn "未检测到 pnpm(仅 dsh 图形门户需要)" }
+if ($pnpmOk) { Ok "pnpm $(pnpm --version 2>$null)" } else { Warn "未检测到 pnpm(仅 dsh 图形门户需要, 后续会用 npm 自动安装)" }
+$nodeOk = [bool]$nodeExe0   # 含 .runtime 便携版, 与后面启动门户时的判定一致
 $wingetOk = [bool](Get-Command winget -ErrorAction SilentlyContinue)
 if ($wingetOk) { Ok "winget 可用(自动安装通道就绪)" } else { Warn "未检测到 winget, 缺失组件将无法自动安装" }
 
