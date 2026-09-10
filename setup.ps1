@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.7.3 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.7.4 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -62,6 +62,13 @@
 #                      (pnpm ELIFECYCLE + Node 崩溃堆栈 "build: build:lib exited with 1"),
 #                      看不到真正的第一手编译/打包错误。现在失败时自动摘出所有关键错误行
 #                      (去重计数 + 行号) 并附尾部 15 行, 同时给出两份完整日志路径
+#                v2.7.4: 修构建的真实根因 ERR_PNPM_BAD_PM_VERSION —— 上游 harness 在
+#                      package.json 里 pin 了 "packageManager": "pnpm@11.7.0", 而本脚本
+#                      在无 pnpm 时装的是 pnpm@12; pnpm 版本与 pin 不符时 `pnpm run`
+#                      会直接硬失败(install 不校验, 所以"装得好好的、一构建就炸")。
+#                      现在 Ensure-Pnpm 接受上游 pin: 读 package.json 的 packageManager,
+#                      现有 pnpm 不匹配就换装同版本(pnpm@12 的机器会自动降到 11.7.0);
+#                      harness 的依赖安装、构建、以及 [D] 前台启动(pnpm run dsh)都带这个 pin
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -233,19 +240,84 @@ function Install-PortableNode {
     return $nodeExe
 }
 
-# 用已就绪 node 的 npm 全局安装 pnpm@12(幂等); 返回 pnpm 命令或 $null
-function Ensure-Pnpm([string]$NodeExe) {
+# 读上游 harness 在 package.json 里声明的 pnpm 版本(packageManager, 形如 "pnpm@11.7.0")。
+# 这是硬约束: pnpm 发现 packageManager 与自己版本不符时, `pnpm run` 会直接抛
+# ERR_PNPM_BAD_PM_VERSION(提示 "set the pmOnFail configuration to warn or ignore")。
+# 注意 `pnpm install` 不校验该字段 —— 所以典型症状是"依赖装得好好的, 一构建就炸"。
+function Get-HarnessPnpmVersion([string]$Harness) {
+    if (-not $Harness) { return '' }
+    $pj = Join-Path $Harness "package.json"
+    if (-not (Test-Path $pj)) { return '' }
+    $txt = Get-Content -LiteralPath $pj -Raw -ErrorAction SilentlyContinue
+    if (-not $txt) { return '' }
+    $m = [regex]::Match($txt, '"packageManager"\s*:\s*"pnpm@([^"]+)"')
+    if (-not $m.Success) { return '' }
+    return $m.Groups[1].Value.Trim()
+}
+
+function Get-PnpmVersion([string]$PnpmCmd) {
+    if (-not $PnpmCmd) { return '' }
+    try {
+        $v = (& $PnpmCmd --version 2>$null | Select-Object -First 1)
+        if (-not $v) { return '' }
+        return ("$v").Trim()
+    } catch { return '' }
+}
+
+# 精确 pin(11.7.0)必须完全一致; 范围(^11 / >=11 <12 / 11)只比主版本, 避免无谓重装
+function Test-PnpmSatisfies([string]$Version, [string]$Wanted) {
+    if (-not $Wanted) { return $true }
+    if (-not $Version) { return $false }
+    if ($Wanted -match '^\d+\.\d+\.\d+') { return ($Version -eq $Wanted) }
+    $wm = [regex]::Match($Wanted, '\d+')
+    $vm = [regex]::Match($Version, '\d+')
+    if (-not $wm.Success -or -not $vm.Success) { return $true }
+    return ($wm.Value -eq $vm.Value)
+}
+
+# $Wanted = 上游 pin 的 pnpm 版本。版本不符必须换成同版本, 否则 `pnpm run` 必失败;
+# 优先隔离安装到 .runtime(不动用户的全局 pnpm, 也不依赖写权限), 失败才退回全局安装
+function Ensure-Pnpm([string]$NodeExe, [string]$Wanted = '') {
     $pnpm = (Get-Command pnpm -ErrorAction SilentlyContinue).Source
-    if ($pnpm) { return $pnpm }
+    $cur = Get-PnpmVersion $pnpm
+    if ($pnpm -and (Test-PnpmSatisfies $cur $Wanted)) { return $pnpm }
     $npmCmd = Join-Path (Split-Path $NodeExe) "npm.cmd"
-    if (-not (Test-Path $npmCmd)) { return $null }
-    Warn "未检测到 pnpm, 用 npm 安装 pnpm@12 ..."
-    & $npmCmd install -g pnpm@12 --silent | Out-Null
+    if (-not (Test-Path $npmCmd)) {
+        if ($pnpm) {
+            Warn "现有 pnpm $cur 不满足上游 pin($Wanted), 且缺 npm.cmd 无法自动调整"
+            Warn "请手动执行: npm install -g pnpm@$Wanted (否则构建会报 ERR_PNPM_BAD_PM_VERSION)"
+            return $pnpm
+        }
+        return $null
+    }
+    $spec = if ($Wanted) { $Wanted } else { '12' }
+    # 1) 隔离安装(推荐): .runtime\pnpm-<spec>, 与用户自己的 pnpm 互不干扰
+    $dir = Join-Path $RUNTIME ("pnpm-" + ($spec -replace '[^0-9A-Za-z\.\-]', ''))
+    $localCmd = Join-Path $dir "node_modules\.bin\pnpm.cmd"
+    if (-not (Test-Path $localCmd)) {
+        if ($pnpm) { Warn "现有 pnpm $cur 不满足上游 pin($Wanted), 隔离安装 pnpm@$spec 到 .runtime ..." }
+        else { Warn "未检测到 pnpm, 隔离安装 pnpm@$spec 到 .runtime ..." }
+        try { & $npmCmd install --prefix "$dir" "pnpm@$spec" --silent --no-audit --no-fund | Out-Null } catch { }
+    }
+    if (Test-Path $localCmd) {
+        $lv = Get-PnpmVersion $localCmd
+        if (Test-PnpmSatisfies $lv $Wanted) { Ok "pnpm $lv(.runtime 隔离安装, 匹配上游 pin: $Wanted)"; return $localCmd }
+        Warn "隔离安装的 pnpm 版本不符(现 $lv, 期望 $Wanted)"
+    }
+    # 2) 退回全局安装(会替换机器上现有的全局 pnpm)
+    if ($pnpm) { Warn "退回全局安装 pnpm@$spec(将替换现有全局 pnpm $cur) ..." }
+    else { Warn "退回全局安装 pnpm@$spec ..." }
+    & $npmCmd install -g "pnpm@$spec" --silent | Out-Null
     $pnpm = (Get-Command pnpm -ErrorAction SilentlyContinue).Source
     if (-not $pnpm) {
         $prefix = (& $npmCmd prefix -g 2>$null | Select-Object -First 1)
         $pc = Join-Path $prefix "pnpm.cmd"
         if (Test-Path $pc) { $pnpm = $pc }
+    }
+    if ($pnpm) {
+        $new = Get-PnpmVersion $pnpm
+        if (Test-PnpmSatisfies $new $Wanted) { Ok "pnpm $new(匹配上游 pin: $Wanted)" }
+        else { Warn "pnpm 版本仍不匹配(现 $new, 上游 pin $Wanted): 构建可能报 ERR_PNPM_BAD_PM_VERSION" }
     }
     return $pnpm
 }
@@ -406,7 +478,13 @@ function Invoke-PnpmInstallProgress {
         $c1 = Join-Path $wrapDir "node_modules\pnpm\bin\pnpm.cjs"
         if (Test-Path $c1) { $js = $c1 }
         if (-not $js) {
-            # 候选2: corepack shim 布局  <nodejs>\node_modules\corepack\dist\pnpm.js
+            # 候选2: npm --prefix 隔离安装布局  <dir>\node_modules\.bin\..\pnpm\bin\pnpm.cjs
+            # (Ensure-Pnpm 把 pin 版本 pnpm 装到 .runtime\pnpm-<ver> 时就是这种结构)
+            $cp = Join-Path $wrapDir "..\pnpm\bin\pnpm.cjs"
+            if (Test-Path $cp) { $js = (Resolve-Path -LiteralPath $cp).Path }
+        }
+        if (-not $js) {
+            # 候选3: corepack shim 布局  <nodejs>\node_modules\corepack\dist\pnpm.js
             # (pnpm.ps1/.cmd 与 corepack 同目录; node 直跑该文件 = 执行 corepack pnpm,
             #  会按工程 packageManager 字段自动选用正确版本, 与命令行 pnpm 完全等价)
             $c2 = Join-Path $wrapDir "node_modules\corepack\dist\pnpm.js"
@@ -776,7 +854,8 @@ function Invoke-HarnessBuild {
     Warn "不构建直接启动门户会报 plugin degraded / client bundles not found; 现在开始构建(纯本地编译, 首次约 3-10 分钟) ..."
     $nodeExe = Ensure-NodeRuntime
     if (-not $nodeExe) { Err "node 不可用, 无法构建门户运行时"; return $false }
-    $pnpm = Ensure-Pnpm $nodeExe
+    # 必须用上游 pin 的 pnpm 版本, 否则 `pnpm run build` 直接 ERR_PNPM_BAD_PM_VERSION
+    $pnpm = Ensure-Pnpm $nodeExe (Get-HarnessPnpmVersion $Harness)
     if (-not $pnpm) { Err "pnpm 不可用, 无法构建门户运行时(可手动: cd '$Harness' ; pnpm run build)"; return $false }
     $logDir = Join-Path $RUNTIME "logs"
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -788,6 +867,11 @@ function Invoke-HarnessBuild {
     $wrapDir = Split-Path $pnpm
     $c1 = Join-Path $wrapDir "node_modules\pnpm\bin\pnpm.cjs"
     if (Test-Path $c1) { $js = $c1 }
+    if (-not $js) {
+        # npm --prefix 隔离安装布局(.runtime\pnpm-<ver>)
+        $cp = Join-Path $wrapDir "..\pnpm\bin\pnpm.cjs"
+        if (Test-Path $cp) { $js = (Resolve-Path -LiteralPath $cp).Path }
+    }
     if (-not $js) {
         $c2 = Join-Path $wrapDir "node_modules\corepack\dist\pnpm.js"
         if (Test-Path $c2) { $js = $c2 }
@@ -943,7 +1027,7 @@ function Invoke-HarnessBootstrap {
         $nodeExe = Ensure-NodeRuntime
         if (-not $nodeExe) { Warn "未检测到 node, 自动下载便携版(约 36MB)..."; $nodeExe = Install-PortableNode }
         if (-not $nodeExe) { Err "node 获取失败, 无法安装门户依赖"; return $false }
-        $pnpm = Ensure-Pnpm $nodeExe
+        $pnpm = Ensure-Pnpm $nodeExe (Get-HarnessPnpmVersion $h)
         if (-not $pnpm) { Err "pnpm 安装失败, 请手动执行 npm install -g pnpm 后重跑"; return $false }
         Ok "node $(& $nodeExe --version 2>$null) / pnpm $(& $pnpm --version 2>$null)"
         if (-not (Invoke-PnpmInstallProgress -WorkDir $h -PnpmCmd $pnpm -NodeExe $nodeExe -Label "deepseek-harness 依赖安装 (pnpm install)")) {
@@ -1283,7 +1367,7 @@ switch ($choice) {
         if (-not (Invoke-HarnessBootstrap -FetchIfMissing)) { Err "门户运行时未就绪, 未能启动"; break }
         $nodeExe = Ensure-NodeRuntime
         if (-not $nodeExe) { Err "node 不可用, 无法启动门户"; break }
-        $pnpm = Ensure-Pnpm $nodeExe
+        $pnpm = Ensure-Pnpm $nodeExe (Get-HarnessPnpmVersion (Join-Path $ROOT "deepseek-harness"))
         if (-not $pnpm) { Err "pnpm 不可用, 无法启动门户"; break }
         $gen = New-DshPatch
         if (-not $gen) { Err "未找到 dsh-cordis.patch.yml 模板"; break }
