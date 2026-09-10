@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.7.0 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.7.1 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -45,6 +45,10 @@
 #                      看门狗阈值按阶段放宽(解析 600s / 下载链接 300s), 避免把"正常但安静"的
 #                      安装误杀成残缺目录; 环境识别与启动用的 node 判定统一(都认 .runtime 便携版),
 #                      不再出现"前面说没检测到 node, 后面却用着 v24.x 便携版"的矛盾提示
+#                v2.7.1: 修复"空日志/.npmrc 导致脚本直接抛异常中断": Get-Content -Raw 对空文件
+#                      返回 $null, 直接喂给 [regex]::Match 会报 "值不能为 null。参数名: input";
+#                      门户启动前的复用检查(上次失败留下 0 字节 dsh-web.out.log)与镜像探测
+#                      (空 .npmrc)两处都改为先取回文本、判空后再匹配
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -279,8 +283,13 @@ function Start-DshPortal {
     param([string]$Harness)
     # 幂等: 上次启动的门户若仍在运行(端口可连), 直接复用并打开, 不重复起实例
     $plog = Join-Path $RUNTIME "logs\dsh-web.out.log"
-    if (Test-Path $plog) {
-        $pm = [regex]::Match((Get-Content -LiteralPath $plog -Raw -ErrorAction SilentlyContinue), 'dsh web:\s*(https?://[^\s"<>|]+)')
+    # 上次启动失败(例如进程秒退)会留下 0 字节日志: Get-Content -Raw 返回 $null,
+    # 直接喂给 [regex]::Match 会抛 "值不能为 null。参数名: input"(EAP=Stop 下整个脚本中断),
+    # 所以先取回文本、判空后再匹配。
+    $prevLog = $null
+    if (Test-Path $plog) { $prevLog = Get-Content -LiteralPath $plog -Raw -ErrorAction SilentlyContinue }
+    if ($prevLog) {
+        $pm = [regex]::Match($prevLog, 'dsh web:\s*(https?://[^\s"<>|]+)')
         if ($pm.Success) {
             $pu = $pm.Groups[1].Value.TrimEnd(')',']',',','.','|',';','；','，')
             $hm = [regex]::Match($pu, 'https?://(localhost|127\.0\.0\.1|\[::1\]):(\d+)')
@@ -399,8 +408,12 @@ function Invoke-PnpmInstallProgress {
         if (-not $regCfg) {
             foreach ($rc in @((Join-Path $env:USERPROFILE '.npmrc'), (Join-Path $WorkDir '.npmrc'))) {
                 if (Test-Path $rc) {
-                    $m = [regex]::Match((Get-Content -LiteralPath $rc -Raw -ErrorAction SilentlyContinue), '(?m)^\s*registry\s*=\s*(\S+)')
-                    if ($m.Success) { $regCfg = $m.Groups[1].Value }
+                    # 空 .npmrc 同样会让 -Raw 返回 $null -> 先判空再 Match
+                    $rcTxt = Get-Content -LiteralPath $rc -Raw -ErrorAction SilentlyContinue
+                    if ($rcTxt) {
+                        $m = [regex]::Match($rcTxt, '(?m)^\s*registry\s*=\s*(\S+)')
+                        if ($m.Success) { $regCfg = $m.Groups[1].Value }
+                    }
                 }
             }
         }
