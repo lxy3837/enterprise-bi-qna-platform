@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.6.5 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.6.6 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -20,6 +20,11 @@
 #                v2.6.5: pnpm 进度改为"真进度" —— 优先 --reporter=ndjson 结构化事件,
 #                      按包计数显示 解析 N / 已下载 X / 已链接 Y; 老 pnpm 不认该参数时
 #                      自动回退 v2.6.4 的体积估算, 两者都不影响安装本身
+#                v2.6.6: 适配 pnpm 11/12 真实 ndjson 事件(level 为字符串、imported 事件不带
+#                      packageId 需从 to 路径反推、pnpm:stage 给出真实阶段), 进度按"解析/
+#                      下载/链接"显示; 回显 stderr(corepack 下载/网络错误不再隐形);
+#                      日志长时间无输出时提示"可能在等网络"; 检测到直连 registry.npmjs.org
+#                      时仅对本次安装注入国内镜像(DSH_SETUP_NO_MIRROR=1 可关闭)
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -357,6 +362,24 @@ function Invoke-PnpmInstallProgress {
         finally { Pop-Location }
     }
     Warn "$Label (进度条在窗口顶部, 请保持联网; 详细日志: $o)"
+    # 国内直连 registry.npmjs.org 常见极慢(解析/下载一卡几十分钟, 看着像卡死):
+    # 未检测到自定义源时, 仅对本次安装进程注入国内镜像(不改用户全局 .npmrc);
+    # 需要临时关闭: set DSH_SETUP_NO_MIRROR=1
+    if (-not $env:DSH_SETUP_NO_MIRROR) {
+        $regCfg = $env:npm_config_registry
+        if (-not $regCfg) {
+            foreach ($rc in @((Join-Path $env:USERPROFILE '.npmrc'), (Join-Path $WorkDir '.npmrc'))) {
+                if (Test-Path $rc) {
+                    $m = [regex]::Match((Get-Content -LiteralPath $rc -Raw -ErrorAction SilentlyContinue), '(?m)^\s*registry\s*=\s*(\S+)')
+                    if ($m.Success) { $regCfg = $m.Groups[1].Value }
+                }
+            }
+        }
+        if (-not $regCfg -or $regCfg -match 'registry\.npmjs\.org') {
+            $env:npm_config_registry = 'https://registry.npmmirror.com'
+            Warn "未检测到自定义 npm 源, 已为本次安装启用国内镜像 registry.npmmirror.com(设置 DSH_SETUP_NO_MIRROR=1 可关闭)"
+        }
+    }
     $useNdjson = $true     # 真进度开关; 老 pnpm 不认该参数时置 $false 重跑
     $summarySeen = $false  # ndjson 模式下 "安装完成汇总" 是否出现(成功兜底判据)
     $attempt = 0
@@ -366,8 +389,13 @@ function Invoke-PnpmInstallProgress {
         Remove-Item $o, $e -Force -ErrorAction SilentlyContinue
         $pnpmArgs = @($js, 'install', '--no-frozen-lockfile')
         if ($useNdjson) { $pnpmArgs += '--reporter=ndjson' }
-        # 体积估算兜底用: store 与 node_modules\.pnpm 的初始占用
-        $measDirs = @((Join-Path $env:LOCALAPPDATA "pnpm\store"), (Join-Path $WorkDir "node_modules\.pnpm"))
+        # 体积估算兜底用: store 常见落点(自定义 store-dir 的场景尽量都覆盖) + node_modules\.pnpm
+        $measDirs = @(
+            (Join-Path $env:LOCALAPPDATA "pnpm\store"),
+            (Join-Path $WorkDir "node_modules\.pnpm"),
+            (Join-Path $WorkDir ".pnpm-store"),
+            (Join-Path (Split-Path $WorkDir) ".pnpm-store")
+        )
         $size0 = 0
         if (-not $useNdjson) {
             foreach ($m in $measDirs) { if (Test-Path $m) { $size0 += @(Get-ChildItem -LiteralPath $m -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum } }
@@ -376,13 +404,27 @@ function Invoke-PnpmInstallProgress {
         $resolved = New-Object 'System.Collections.Generic.HashSet[string]'
         $obtained = New-Object 'System.Collections.Generic.HashSet[string]'
         $imported = New-Object 'System.Collections.Generic.HashSet[string]'
-        $lastOut = 0; $spin = 0; $tick = 0; $echoN = 0
+        $lastOut = 0; $lastErr = 0; $spin = 0; $tick = 0; $echoN = 0
+        $stage = ''; $lastGrowAt = 0.0   # 真实阶段(pnpm:stage) 与 日志最后增长时刻(判断"卡死"用)
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $proc = Start-Process -FilePath $NodeExe -ArgumentList $pnpmArgs -WorkingDirectory $WorkDir -RedirectStandardOutput $o -RedirectStandardError $e -NoNewWindow -PassThru
         while (-not $proc.HasExited) {
             Start-Sleep -Milliseconds 900
             $spin++; $tick++
-            # 增量读日志: ndjson 模式解析进度事件; 文本模式回显 pnpm 生命期/警告行
+            # 先回显 stderr 增量(corepack 下载提示、网络错误都在这里, 默认看不见会像卡死)
+            if (Test-Path $e) {
+                $allE = Get-Content -LiteralPath $e -Raw -ErrorAction SilentlyContinue
+                if ($allE -and $allE.Length -gt $lastErr) {
+                    ($allE.Substring($lastErr)) -split "\r?\n" | ForEach-Object {
+                        if ($_ -and $_ -notmatch '^\s*$') {
+                            $echoN++
+                            if ($echoN -le 60) { Write-Host ("    [stderr] " + $_) -ForegroundColor DarkYellow }
+                        }
+                    }
+                    $lastErr = $allE.Length
+                }
+            }
+            # 增量读 stdout: ndjson 模式解析进度事件; 文本模式回显 pnpm 生命期/警告行
             if (Test-Path $o) {
                 $all = Get-Content -LiteralPath $o -Raw -ErrorAction SilentlyContinue
                 if ($all -and $all.Length -gt $lastOut) {
@@ -393,6 +435,11 @@ function Invoke-PnpmInstallProgress {
                                 $st = ''; $id = ''
                                 if ($_ -match '"status":"([a-z_]+)"') { $st = $Matches[1] }
                                 if ($_ -match '"packageId":"([^"]+)"') { $id = $Matches[1] }
+                                if (-not $id -and $_ -match '"to":"((?:[^"\\]|\\.)*)"') {
+                                    # imported 事件不带 packageId: 从 to 路径 ...\.pnpm\<pkg>\node_modules\<name> 反推
+                                    $toPath = $Matches[1] -replace '\\\\', '\'
+                                    if ($toPath -match '\.pnpm\\([^\\]+)\\node_modules') { $id = $Matches[1] }
+                                }
                                 if ($id) {
                                     switch ($st) {
                                         'resolved'       { [void]$resolved.Add($id) }
@@ -401,15 +448,17 @@ function Invoke-PnpmInstallProgress {
                                         'imported'       { [void]$imported.Add($id) }
                                     }
                                 }
+                            } elseif ($_ -match '"name":"pnpm:stage"' -and $_ -match '"stage":"([a-z_]+)"') {
+                                # 真实阶段: resolution_started/done -> importing_started/done
+                                $stage = $Matches[1]
                             } elseif ($_ -match '"name":"pnpm:summary"') {
                                 $summarySeen = $true
-                                if ($_ -match '"message":"((?:[^"\\]|\\.)*)"') {
-                                    $echoN++
-                                    if ($echoN -le 60) { Write-Host ("    " + ($Matches[1] -replace '\\n', ' ')) -ForegroundColor DarkGray }
-                                }
-                            } elseif ($_ -match '"level":(50|60)' -and $_ -match '"message":"((?:[^"\\]|\\.)*)"') {
+                            } elseif ($_ -match '"level":(?:60|"error")' -and $_ -match '"message":"((?:[^"\\]|\\.)*)"') {
                                 $echoN++
                                 if ($echoN -le 60) { Write-Host ("    " + ($Matches[1] -replace '\\n', ' ')) -ForegroundColor DarkYellow }
+                            } elseif ($_ -match '"level":(?:40|50|"warn")' -and $_ -match '"message":"((?:[^"\\]|\\.)*)"') {
+                                $echoN++
+                                if ($echoN -le 60) { Write-Host ("    " + ($Matches[1] -replace '\\n', ' ')) -ForegroundColor DarkGray }
                             }
                         } elseif ($_ -notmatch 'Progress:' -and $_ -match 'WARN|ERR|Packages:|added|Done in|Already up|Unsupported|deprecat|vulnerab|Ignored build') {
                             $echoN++
@@ -417,9 +466,22 @@ function Invoke-PnpmInstallProgress {
                         }
                     }
                     $lastOut = $all.Length
+                    $lastGrowAt = $sw.Elapsed.TotalSeconds
                 }
             }
             $secs = [int]$sw.Elapsed.TotalSeconds
+            # "日志长时间无新增" 提示: 用来区分"在慢慢跑"与"真的卡死"
+            $idleTip = ''
+            if ($lastGrowAt -gt 0 -and ($sw.Elapsed.TotalSeconds - $lastGrowAt) -gt 240) {
+                $idleTip = ("（日志已 {0} 分钟无输出, 可能在等网络/源较慢）" -f [int](($sw.Elapsed.TotalSeconds - $lastGrowAt) / 60))
+            }
+            $stageTxt = switch ($stage) {
+                'resolution_started' { '解析依赖中: ' }
+                'resolution_done'    { '下载依赖中: ' }
+                'importing_started'  { '链接到 node_modules 中: ' }
+                'importing_done'     { '收尾中: ' }
+                default              { '解析依赖/连接源中: ' }
+            }
             if ($useNdjson) {
                 $tot = $resolved.Count
                 $got = $obtained.Count
@@ -427,9 +489,9 @@ function Invoke-PnpmInstallProgress {
                 $done = [math]::Max($got, $imp)
                 if ($tot -ge 3 -and $done -gt 0) {
                     $pct = [int][math]::Min(99.0, $done * 100.0 / $tot)
-                    Write-Progress -Activity $Label -Status ("依赖包 {0}/{1}（已下载 {2} · 已链接 {3}）| 已用时 {4}m{5}s" -f $done, $tot, $got, $imp, [int]($secs/60), ($secs%60)) -PercentComplete $pct
+                    Write-Progress -Activity $Label -Status ("{0}依赖包 {1}/{2}（已下载 {3} · 已链接 {4}）{5}| 已用时 {6}m{7}s" -f $stageTxt, $done, $tot, $got, $imp, $idleTip, [int]($secs/60), ($secs%60)) -PercentComplete $pct
                 } else {
-                    Write-Progress -Activity $Label -Status ("解析依赖/连接源中: 已解析 {0} 个包（该阶段 pnpm 静默数分钟属正常）| 已用时 {1}m{2}s" -f $tot, [int]($secs/60), ($secs%60)) -PercentComplete ($spin % 100)
+                    Write-Progress -Activity $Label -Status ("{0}已解析 {1} 个包（pnpm 解析大工程较久, 静默属正常）{2}| 已用时 {3}m{4}s" -f $stageTxt, $tot, $idleTip, [int]($secs/60), ($secs%60)) -PercentComplete ($spin % 100)
                 }
             } else {
                 # 兜底: 体积估算(每 3 tick 量一次, 递归枚举大目录较费 IO)
@@ -475,7 +537,7 @@ function Invoke-PnpmInstallProgress {
             $allTxt = ""
             foreach ($f in @($o, $e)) { if (Test-Path $f) { $allTxt += (Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue) } }
             $doneOK = ($allTxt -match "Done in \d") -or ($useNdjson -and $summarySeen)
-            $fatal  = $allTxt -match "(?i)(ELIFECYCLE|ERR_PNPM_|Command failed|EINTEGRITY|ETIMEDOUT|EAI_AGAIN|ENOSPC|EPERM|EACCES|ENOTEMPTY|FetchError|npm error)" -or ($useNdjson -and $allTxt -match '"level":60')
+            $fatal  = $allTxt -match "(?i)(ELIFECYCLE|ERR_PNPM_|Command failed|EINTEGRITY|ETIMEDOUT|EAI_AGAIN|ENOSPC|EPERM|EACCES|ENOTEMPTY|FetchError|npm error)" -or ($useNdjson -and $allTxt -match '"level":(?:60|"error")')
             if ($modOk -and $doneOK -and -not $fatal) { $code = 0 }
         }
     }
