@@ -74,6 +74,20 @@
 #                      根构建配置)里任何文件比 .dsh-build 构建记录新, 就判定产物过期并自动
 #                      重建(2 秒容差)。配合 harness 源码(含企业定制, 基线 0.1.3-alpha.1)
 #                      已随主仓库分发: 新机器 clone 后源码即在, 不再从官方上游拉原版
+#                v2.7.6: 修复"全新机器(无 Windows SDK)装不上、起不来"的两个独立问题 ——
+#                      1) fs-ext 原生模块拖垮整个 install: 它只提供 POSIX 的 flock(2),
+#                         Windows 分支走的是 Win32 命名信号量(harness 的 lease.ts/win32.ts),
+#                         flock 在 Windows 上永不调用; 但它在 pnpm-workspace.yaml 的
+#                         allowBuilds 里要求 node-gyp 现场编译, 目标机常见"装了 VS 的 C++
+#                         工具集、没勾 Windows SDK", 报 gyp ERR! find VS - missing any
+#                         Windows SDK 并中断安装。现在缺 SDK 时临时让 pnpm 跳过该构建脚本
+#                         (装完还原上游配置), 再补上仓库预置的 win32-x64 原生绑定
+#                         (tools\prebuilt\fs-ext\<平台>-abi<ABI>, 按 setup 固定的 node 版本
+#                         编译归档); 有 SDK 的机器配置与行为完全不变
+#                      2) 'pnpm' 不是内部或外部命令: 隔离安装的 pnpm 与便携 node 都不在
+#                         PATH 上, 而 pnpm 内部还会再 spawn `pnpm`(依赖状态自检)与 `node`
+#                         (跑 build 子脚本)。现在安装/构建/启动前把两者目录前置到 PATH
+#                         (子进程继承), 已在 PATH 中的不重复添加
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -280,6 +294,104 @@ function Test-PnpmSatisfies([string]$Version, [string]$Wanted) {
     return ($wm.Value -eq $vm.Value)
 }
 
+# pnpm 自己会再 spawn 一次 `pnpm`(依赖状态自检 / 跑子脚本)和 `node`, 二者都靠 PATH 查找。
+# 隔离安装的 pnpm(.runtime\pnpm-<ver>\node_modules\.bin)与便携 node 默认都不在 PATH 上,
+# 于是子进程直接报: 'pnpm' 不是内部或外部命令, 也不是可运行的程序或批处理文件。
+# 这里把两者所在目录前置到 PATH(子进程继承); 已在 PATH 中的不重复添加。
+function Add-ToolDirsToPath([string]$NodeExe, [string]$PnpmCmd) {
+    $dirs = @()
+    if ($NodeExe) { $d = Split-Path $NodeExe -Parent; if ($d) { $dirs += $d } }
+    if ($PnpmCmd) { $d = Split-Path $PnpmCmd -Parent; if ($d) { $dirs += $d } }
+    if ($dirs.Count -eq 0) { return }
+    $cur = @($env:PATH -split ';' | Where-Object { $_ })
+    $add = @($dirs | Where-Object { $_ -and (Test-Path $_) -and ($cur -notcontains $_) })
+    if ($add.Count -gt 0) { $env:PATH = (($add + $cur) -join ';') }
+}
+
+# 取 node 的模块 ABI(NODE_MODULE_VERSION)。原生 .node 只能被同 ABI 的 node 加载,
+# 预置的 fs-ext 绑定就按该值归档(tools\prebuilt\fs-ext\win32-x64-abi<ABI>)。
+function Get-NodeAbi([string]$NodeExe) {
+    if (-not $NodeExe) { return '' }
+    try {
+        $a = (& $NodeExe -p 'process.versions.modules' 2>$null | Select-Object -First 1)
+        if ($a) { return ("$a").Trim() }
+    } catch { }
+    return ''
+}
+
+# ------------------------------------------------- fs-ext 原生绑定(Windows 专用)
+# fs-ext 只提供 POSIX 的 flock(2); Windows 分支走的是 Win32 命名信号量
+# (harness: packages/session/session-persistence-jsonl/src/{lease,win32}.ts),
+# 那个 flock 在 Windows 上永不调用。但 lease.ts 是顶层 `import { flock } from 'fs-ext'`,
+# 模块一加载就 require -> build\Release\fs_ext.node 必须存在。
+# 而它在 pnpm-workspace.yaml 的 allowBuilds 里是 true(要 node-gyp 现场编译), 目标机又常见
+# "只装了 VS 的 C++ 工具集、没勾 Windows SDK", 编译必失败并拖垮整个 install:
+#   gyp ERR! find VS - missing any Windows SDK
+#   gyp ERR! stack Error: Could not find any Visual Studio installation to use
+# 对策: 缺 SDK 的机器临时让 pnpm 跳过 fs-ext 的构建脚本, 装完再补仓库预置的绑定。
+function Get-PrebuiltFsExt([string]$Abi) {
+    if (-not $Abi) { return $null }
+    $p = Join-Path $ROOT "tools\prebuilt\fs-ext\win32-x64-abi$Abi\fs_ext.node"
+    if (Test-Path $p) { return $p }
+    return $null
+}
+
+# 缺 Windows SDK -> node-gyp 必失败。有 SDK 的机器不动配置, 照常现场编译。
+function Test-MissingWindowsSdk {
+    foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots',
+                        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots')) {
+        $v = (Get-ItemProperty -Path $root -Name KitsRoot10 -ErrorAction SilentlyContinue).KitsRoot10
+        if (-not $v) { continue }
+        $inc = Join-Path $v 'Include'
+        if (-not (Test-Path $inc)) { continue }
+        if (@(Get-ChildItem $inc -Directory -ErrorAction SilentlyContinue).Count -gt 0) { return $false }
+    }
+    return $true
+}
+
+# 把 pnpm-workspace.yaml 里 allowBuilds 的 fs-ext 开关改成 $Enabled(装完要还原)。
+# 返回 $true = 文件已达目标状态; $false = 没找到该字段(调用方无需还原)。
+function Set-FsExtBuild([string]$Harness, [bool]$Enabled) {
+    $f = Join-Path $Harness "pnpm-workspace.yaml"
+    if (-not (Test-Path $f)) { return $false }
+    $txt = [IO.File]::ReadAllText($f)
+    $m = [regex]::Match($txt, '(?m)^([ \t]*)fs-ext:[ \t]*(true|false)[ \t]*$')
+    if (-not $m.Success) { return $false }
+    $want = if ($Enabled) { 'true' } else { 'false' }
+    if ($m.Groups[2].Value -eq $want) { return $true }
+    $new = $txt.Substring(0, $m.Index) + $m.Groups[1].Value + 'fs-ext: ' + $want + $txt.Substring($m.Index + $m.Length)
+    [IO.File]::WriteAllText($f, $new, (New-Object System.Text.UTF8Encoding($false)))
+    return $true
+}
+
+# fs_ext.node 是否已就位(有过安装的机器第二次跑时 node_modules 已被判定为"就绪", 不会再走安装)
+function Test-FsExtBindingReady([string]$Harness) {
+    $base = Join-Path $Harness "node_modules\.pnpm"
+    if (-not (Test-Path $base)) { return $false }
+    foreach ($pk in @(Get-ChildItem $base -Directory -Filter 'fs-ext@*' -ErrorAction SilentlyContinue)) {
+        if (Test-Path (Join-Path $pk.FullName "node_modules\fs-ext\build\Release\fs_ext.node")) { return $true }
+    }
+    return $false
+}
+
+# 把预置绑定放进 pnpm 链接出的包目录(版本号可能随上游变, 按 fs-ext@* 匹配)
+function Install-PrebuiltFsExt([string]$Harness, [string]$Src) {
+    $base = Join-Path $Harness "node_modules\.pnpm"
+    if (-not (Test-Path $base)) { return $false }
+    $done = 0
+    foreach ($pk in @(Get-ChildItem $base -Directory -Filter 'fs-ext@*' -ErrorAction SilentlyContinue)) {
+        $pkgDir = Join-Path $pk.FullName "node_modules\fs-ext"
+        if (-not (Test-Path $pkgDir)) { continue }
+        $dest = Join-Path $pkgDir "build\Release"
+        try {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            Copy-Item $Src (Join-Path $dest "fs_ext.node") -Force
+            $done++
+        } catch { }
+    }
+    return ($done -gt 0)
+}
+
 # $Wanted = 上游 pin 的 pnpm 版本。版本不符必须换成同版本, 否则 `pnpm run` 必失败;
 # 优先隔离安装到 .runtime(不动用户的全局 pnpm, 也不依赖写权限), 失败才退回全局安装
 function Ensure-Pnpm([string]$NodeExe, [string]$Wanted = '') {
@@ -467,6 +579,8 @@ function Start-DshPortal {
 function Invoke-PnpmInstallProgress {
     param([string]$WorkDir, [string]$PnpmCmd, [string]$NodeExe, [string]$Label,
           [string]$ErrHint = "可重跑本脚本, 或手动: cd '$WorkDir' ; pnpm install")
+    # 隔离安装的 pnpm/便携 node 未必在 PATH 上, 而 pnpm 内部还会 spawn `pnpm` 与 `node`
+    Add-ToolDirsToPath $NodeExe $PnpmCmd
     $logDir = Join-Path $RUNTIME "logs"
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $o = Join-Path $logDir "pnpm-install.out.log"
@@ -897,6 +1011,9 @@ function Invoke-HarnessBuild {
     # 必须用上游 pin 的 pnpm 版本, 否则 `pnpm run build` 直接 ERR_PNPM_BAD_PM_VERSION
     $pnpm = Ensure-Pnpm $nodeExe (Get-HarnessPnpmVersion $Harness)
     if (-not $pnpm) { Err "pnpm 不可用, 无法构建门户运行时(可手动: cd '$Harness' ; pnpm run build)"; return $false }
+    # 构建脚本内部会再 spawn `pnpm`/`node`(pnpm 的依赖状态自检 + 各包的 pnpm run 子脚本),
+    # 隔离安装的 pnpm 不在 PATH 上时会报 'pnpm' 不是内部或外部命令
+    Add-ToolDirsToPath $nodeExe $pnpm
     $logDir = Join-Path $RUNTIME "logs"
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $o = Join-Path $logDir "harness-build.out.log"
@@ -1069,12 +1186,36 @@ function Invoke-HarnessBootstrap {
         if (-not $nodeExe) { Err "node 获取失败, 无法安装门户依赖"; return $false }
         $pnpm = Ensure-Pnpm $nodeExe (Get-HarnessPnpmVersion $h)
         if (-not $pnpm) { Err "pnpm 安装失败, 请手动执行 npm install -g pnpm 后重跑"; return $false }
+        Add-ToolDirsToPath $nodeExe $pnpm
         Ok "node $(& $nodeExe --version 2>$null) / pnpm $(& $pnpm --version 2>$null)"
-        if (-not (Invoke-PnpmInstallProgress -WorkDir $h -PnpmCmd $pnpm -NodeExe $nodeExe -Label "deepseek-harness 依赖安装 (pnpm install)")) {
+        # fs-ext 在 pnpm-workspace.yaml 里被列为需 node-gyp 现场编译; 目标机常只装了 VS 的
+        # C++ 工具集、没勾 Windows SDK, 编译必失败并拖垮整个 install -> 临时让 pnpm 跳过它,
+        # 装完由下方统一补仓库预置的绑定(缺 SDK 的机器靠它, 有 SDK 的机器不受影响)
+        $fsExtPatched = $false
+        if ((Test-MissingWindowsSdk) -and (Get-PrebuiltFsExt (Get-NodeAbi $nodeExe))) {
+            Warn "未检测到 Windows SDK(fs-ext 无法现场编译), 改用仓库预置的 win32-x64 原生绑定"
+            $fsExtPatched = Set-FsExtBuild $h $false
+        }
+        $installOk = $false
+        try {
+            $installOk = Invoke-PnpmInstallProgress -WorkDir $h -PnpmCmd $pnpm -NodeExe $nodeExe -Label "deepseek-harness 依赖安装 (pnpm install)"
+        } finally {
+            if ($fsExtPatched) { Set-FsExtBuild $h $true | Out-Null }   # 还原上游配置
+        }
+        if (-not $installOk) {
             Err "deepseek-harness 依赖安装失败, 门户暂不可启动(等价宿主/评测不受影响)。可重跑本脚本或手动: cd '$h' ; pnpm install"
+            if (Test-MissingWindowsSdk) { Err "本机缺 Windows SDK, 原生模块无法编译; 可装 VS 的 'Windows 11 SDK' 组件后重试" }
             return $false
         }
         Ok "deepseek-harness 依赖安装完成"
+    }
+    # fs-ext 原生绑定保障: lease.ts 是顶层 `import { flock } from 'fs-ext'`, 模块加载即 require,
+    # 缺 .node 时宿主启动直接崩。上面跳过编译的机器在此补齐; 已有绑定的机器(含走了现场编译的)不动。
+    if ((Test-MissingWindowsSdk) -and -not (Test-FsExtBindingReady $h)) {
+        $ne = Ensure-NodeRuntime
+        $pb = if ($ne) { Get-PrebuiltFsExt (Get-NodeAbi $ne) } else { $null }
+        if ($pb -and (Install-PrebuiltFsExt $h $pb)) { Ok "已补齐 fs-ext 原生绑定(预置 win32-x64)" }
+        else { Warn "fs-ext 原生绑定未就位(缺 Windows SDK 且无匹配当前 node ABI 的预置绑定), 门户可能起不来" }
     }
     # 构建: 只装依赖不构建, 门户起来后会报 plugin degraded (import) / client bundles not found
     if (-not (Invoke-HarnessBuild -Harness $h)) {
@@ -1409,6 +1550,7 @@ switch ($choice) {
         if (-not $nodeExe) { Err "node 不可用, 无法启动门户"; break }
         $pnpm = Ensure-Pnpm $nodeExe (Get-HarnessPnpmVersion (Join-Path $ROOT "deepseek-harness"))
         if (-not $pnpm) { Err "pnpm 不可用, 无法启动门户"; break }
+        Add-ToolDirsToPath $nodeExe $pnpm
         $gen = New-DshPatch
         if (-not $gen) { Err "未找到 dsh-cordis.patch.yml 模板"; break }
         Ok "前台启动 dsh 图形门户(首次较慢, Ctrl+C 退出)..."
