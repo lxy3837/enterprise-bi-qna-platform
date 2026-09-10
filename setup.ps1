@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.7.4 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.7.7 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -88,6 +88,15 @@
 #                         PATH 上, 而 pnpm 内部还会再 spawn `pnpm`(依赖状态自检)与 `node`
 #                         (跑 build 子脚本)。现在安装/构建/启动前把两者目录前置到 PATH
 #                         (子进程继承), 已在 PATH 中的不重复添加
+#                v2.7.7: 修复 pnpm 11 的"运行前依赖自检"在构建阶段再次拖垮整条链 ——
+#                      pnpm 11 把 verifyDepsBeforeRun 的默认值从 false 改成 install, 于是
+#                      每次 `pnpm run build`(以及 build 脚本内层的 `pnpm --filter ... run`)
+#                      之前, pnpm 都会先自己 spawn 一次 `pnpm install`(内部名
+#                      runDepsStatusCheck)。隔离安装的 pnpm 不在 PATH 上时这一步直接报
+#                      "'pnpm' 不是内部或外部命令", 构建刚起步就退出(日志只有十几行)。
+#                      现在构建期间临时往 pnpm-workspace.yaml 追加 verifyDepsBeforeRun:
+#                      false(上游若已自行配置则不动), 构建结束按原始字节还原 —— 构建前
+#                      刚跑过 pnpm install, 这次自检本就是冗余
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -390,6 +399,34 @@ function Install-PrebuiltFsExt([string]$Harness, [string]$Src) {
         } catch { }
     }
     return ($done -gt 0)
+}
+
+# pnpm 11 起 verifyDepsBeforeRun 的默认值从 false 变成 install: 每次 `pnpm run X` /
+# `pnpm exec` 之前, pnpm 会先自己 spawn 一次 `pnpm install`(内部名 runDepsStatusCheck)
+# 确认 node_modules 与 lockfile 同步。隔离安装的 pnpm 只在 .runtime 下、默认不在 PATH 上,
+# 这一次自检就会报 "'pnpm' 不是内部或外部命令" 并让整条构建链直接退出。
+# 而构建前我们刚跑过 pnpm install, 该自检纯属冗余 —— 构建期间临时往 pnpm-workspace.yaml
+# 追加 verifyDepsBeforeRun: false(上游若已自己配置则不动), 构建结束按原始字节还原。
+# 成功时返回文件原始字节(供 Restore-FileBytes 还原), 未修改/文件不存在时返回 $null。
+function Disable-PnpmDepsCheck([string]$Harness) {
+    $f = Join-Path $Harness "pnpm-workspace.yaml"
+    if (-not (Test-Path $f)) { return $null }
+    $raw = [IO.File]::ReadAllBytes($f)
+    $txt = [IO.File]::ReadAllText($f)
+    if ($txt -match '(?m)^\s*verifyDepsBeforeRun\s*:') { return $null }
+    $add = "`n# [setup.ps1] pnpm 11 的 run 前依赖自检会再 spawn 一次 pnpm(隔离安装时不在 PATH 上);`n" +
+           "# 本行由 setup.ps1 在构建期间临时追加, 构建结束后自动删除。`n" +
+           "verifyDepsBeforeRun: false`n"
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($add)
+    $fs = [IO.File]::Open($f, [IO.FileMode]::Append, [IO.FileAccess]::Write)
+    try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+    Write-Output -NoEnumerate $raw   # 整个字节数组作为一个对象返回, 不被逐字节展开
+}
+
+# 把文件恢复成先前读到的原始字节(Disable-PnpmDepsCheck 的记录值; $null 表示没改过)
+function Restore-FileBytes([string]$Path, $Bytes) {
+    if ($null -eq $Bytes) { return }
+    try { [IO.File]::WriteAllBytes($Path, [byte[]]$Bytes) } catch { }
 }
 
 # $Wanted = 上游 pin 的 pnpm 版本。版本不符必须换成同版本, 否则 `pnpm run` 必失败;
@@ -1035,8 +1072,9 @@ function Invoke-HarnessBuild {
     }
     if (-not $js) {
         Push-Location $Harness
+        $wsRaw = Disable-PnpmDepsCheck $Harness
         try { & $pnpm run build }
-        finally { Pop-Location }
+        finally { Pop-Location; Restore-FileBytes (Join-Path $Harness "pnpm-workspace.yaml") $wsRaw }
         if ($LASTEXITCODE -eq 0 -and (Test-HarnessBuilt $Harness)) { Ok "deepseek-harness 构建完成(各包 lib + apps/web/dist 已生成)"; return $true }
         Err "deepseek-harness 构建失败, 可手动重试: cd '$Harness' ; pnpm run build"
         return $false
@@ -1046,6 +1084,7 @@ function Invoke-HarnessBuild {
     $stallSecs = 300
     if ($env:DSH_SETUP_BUILD_STALL_SECS -match '^\d+$') { $stallSecs = [int]$env:DSH_SETUP_BUILD_STALL_SECS }
     Write-Host ("  正在构建 deepseek-harness(pnpm run build), 详细日志: {0}" -f $o) -ForegroundColor DarkGray
+    $wsRaw = Disable-PnpmDepsCheck $Harness
     $proc = Start-Process -FilePath $nodeExe -ArgumentList @($js, 'run', 'build') -WorkingDirectory $Harness `
         -RedirectStandardOutput $o -RedirectStandardError $e -RedirectStandardInput $in0 -NoNewWindow -PassThru
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -1087,7 +1126,8 @@ function Invoke-HarnessBuild {
             break
         }
     }
-    if ($killed) { return $false }
+    if ($killed) { Restore-FileBytes (Join-Path $Harness "pnpm-workspace.yaml") $wsRaw; return $false }
+    Restore-FileBytes (Join-Path $Harness "pnpm-workspace.yaml") $wsRaw
     $proc.WaitForExit()   # 确保输出管道/句柄全部关闭后再判定
     # 退出码: 多数宿主 WaitForExit 后可正常读取; 个别 PS5.1 环境配重定向时它恒为 $null
     # (实测), 此时记 -1 并交由下方"产物是否齐全"兜底复核, 绝不能因 $null 就误判构建失败。
