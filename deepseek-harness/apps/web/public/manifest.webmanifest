@@ -1,0 +1,16 @@
+{
+  "id": "/",
+  "name": "平台化企业智能问数工作台",
+  "short_name": "智能问数工作台",
+  "start_url": "/",
+  "scope": "/",
+  "display": "fullscreen",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
