@@ -1,0 +1,15 @@
+﻿==== dsh 诊断 2026-09-10 20:10:14 ====
+host : DESKTOP-KMBMDCT
+git  : git version 2.48.0.rc0.windows.1
+---- 便携 node (setup 下载的) ----
+runtime 目录: nodejs
+portable node.exe: D:\project\enterprise-bi-qna-platform\.runtime\nodejs\node-v24.21.0-win-x64\node.exe
+PATH 上有 node   : False
+PATH 上有 pnpm   : False
+---- harness 状态 ----
+package.json : True
+node_modules : True
+构建记录     : False
+web dist     : False
+---- 主仓库版本 ----
+rev: d557521

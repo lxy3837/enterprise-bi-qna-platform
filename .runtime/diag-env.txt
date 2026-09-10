@@ -1,0 +1,7 @@
+﻿==== dsh 诊断 2026-09-10 19:33 ====
+node: 
+pnpm: 
+git : git version 2.48.0.rc0.windows.1
+harness pkg : True
+harness nm  : True
+harness lib : False
