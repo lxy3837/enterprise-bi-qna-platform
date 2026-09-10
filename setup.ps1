@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.6.8 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.6.9 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -35,6 +35,9 @@
 #                      即判定卡死, 自动终止进程树并明确报错(给出可能原因与放宽方法);
 #                      慢网络可用 DSH_SETUP_PNPM_STALL_SECS 放宽(秒)或设 0 关闭;
 #                      日志里出现 corepack 的 "[Y/n]" 询问时直接点名"等不到回车"
+#                v2.6.9: 折叠 pnpm 两类"已知无害"告警(上游 monorepo 包成环 / 非本平台的可选
+#                      二进制被跳过, 如 lightningcss-android-arm64), 每类只留一行灰字说明,
+#                      不再占据日志配额、也不再看着像报错; 设 DSH_SETUP_VERBOSE=1 可看原文
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -406,6 +409,24 @@ function Invoke-PnpmInstallProgress {
     # 默认 60 秒; 慢网络可用环境变量 DSH_SETUP_PNPM_STALL_SECS 放宽(秒), 设 0 关闭看门狗。
     $stallSecs = 60
     if ($env:DSH_SETUP_PNPM_STALL_SECS -match '^\d+$') { $stallSecs = [int]$env:DSH_SETUP_PNPM_STALL_SECS }
+    # 折叠 pnpm 的两类"已知无害"告警(实测 pnpm 11 用 logger.warn 打印, 不会中断安装):
+    #   1) There are cyclic workspace dependencies ...  上游 monorepo 内部包互相依赖成环
+    #   2) Unsupported platform for <pkg>: wanted ...   非本平台的可选二进制被跳过(如 android-arm64)
+    # 默认每类只留一行灰字说明(并让出日志配额给真正的错误), DSH_SETUP_VERBOSE=1 时原样输出。
+    $verbosePnpm = ($env:DSH_SETUP_VERBOSE -eq '1')
+    $noiseKinds = @{}
+    function Test-PnpmBenignNoise {
+        param([string]$Msg)
+        if ($verbosePnpm) { return $false }
+        if ($Msg -notmatch '(?i)(cyclic workspace dependencies|Unsupported platform for )') { return $false }
+        $k = if ($Msg -match '(?i)Unsupported platform for') { 'platform' } else { 'cycle' }
+        $noiseKinds[$k] = 1 + [int]$noiseKinds[$k]
+        if ($noiseKinds[$k] -eq 1) {
+            $desc = if ($k -eq 'platform') { '非本平台的可选依赖被跳过(如 lightningcss-android-arm64)' } else { '工作区内部包互相依赖成环' }
+            Write-Host ("    （已折叠 pnpm 无害告警: $desc；同类提示不再重复, 设 DSH_SETUP_VERBOSE=1 可看原文）") -ForegroundColor DarkGray
+        }
+        return $true
+    }
     $attempt = 0
     $code = -1
     while ($true) {
@@ -445,6 +466,7 @@ function Invoke-PnpmInstallProgress {
                         if ($_ -and $_ -notmatch '^\s*$') {
                             # corepack 交互询问(等不到回车): 记录下来, 看门狗报错时直接点名原因
                             if (-not $promptSeen -and $_ -match '(?i)(\[Y/n\]|Do you want to continue)') { $promptSeen = $_.Trim() }
+                            if (Test-PnpmBenignNoise $_) { return }   # 折叠已知无害告警
                             $echoN++
                             if ($echoN -le 60) { Write-Host ("    [stderr] " + $_) -ForegroundColor DarkYellow }
                         }
@@ -487,10 +509,12 @@ function Invoke-PnpmInstallProgress {
                                 $echoN++
                                 if ($echoN -le 60) { Write-Host ("    " + ($Matches[1] -replace '\\n', ' ')) -ForegroundColor DarkYellow }
                             } elseif ($_ -match '"level":(?:40|50|"warn")' -and $_ -match '"message":"((?:[^"\\]|\\.)*)"') {
+                                if (Test-PnpmBenignNoise $Matches[1]) { return }   # 折叠已知无害告警
                                 $echoN++
                                 if ($echoN -le 60) { Write-Host ("    " + ($Matches[1] -replace '\\n', ' ')) -ForegroundColor DarkGray }
                             }
                         } elseif ($_ -notmatch 'Progress:' -and $_ -match 'WARN|ERR|Packages:|added|Done in|Already up|Unsupported|deprecat|vulnerab|Ignored build') {
+                            if (Test-PnpmBenignNoise $_) { return }   # 折叠已知无害告警
                             $echoN++
                             if ($echoN -le 60) { Write-Host ("    " + $_) -ForegroundColor DarkGray }
                         }
