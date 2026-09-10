@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.7.1 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.7.3 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -58,6 +58,10 @@
 #                      静默看门狗, DSH_SETUP_BUILD_STALL_SECS 可放宽/设 0 关闭),
 #                      启动门户前再校验构建产物(上游构建记录 .dsh-build\client-build-environment.json
 #                      + apps\web\dist + host/client 代表包 lib), 缺失则明确提示而不是硬启动
+#                v2.7.3: 构建/安装失败的取证改为"整份日志扫描" —— 只在窗口里回显了失败链尾部
+#                      (pnpm ELIFECYCLE + Node 崩溃堆栈 "build: build:lib exited with 1"),
+#                      看不到真正的第一手编译/打包错误。现在失败时自动摘出所有关键错误行
+#                      (去重计数 + 行号) 并附尾部 15 行, 同时给出两份完整日志路径
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -721,6 +725,43 @@ function Test-HarnessBuilt([string]$Harness) {
     return $true
 }
 
+# 构建/安装失败时的日志取证: 从整份日志里摘出"关键错误行"(去重计数), 再补一段尾部。
+# 只看尾部会误导 —— pnpm 的 fail 链会层层上报, 尾部往往只有 ELIFECYCLE 和 Node 崩溃堆栈,
+# 第一手的编译器/打包器错误在中段。
+function Show-LogDiagnostics {
+    param([string]$Path, [string]$Title, [int]$MaxHits = 30, [int]$TailLines = 15)
+    if (-not (Test-Path $Path)) { return }
+    $txt = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+    if (-not $txt) { return }
+    $lines = $txt -split "\r?\n"
+    $pat = '(?i)(\berror\b|ERR!|ERR_|\bfailed\b|\bfailure\b|cannot|can''t|missing|not found|unsupported|invalid|unknown|ELIFECYCLE|EPERM|ENOENT|TS\d{3,}|must be|expected|\bignore\b)'
+    $seen = @{}
+    $hits = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $ln = $lines[$i].Trim()
+        if ($ln.Length -eq 0 -or $ln -notmatch $pat) { continue }
+        if ($ln.Length -gt 300) { $ln = $ln.Substring(0, 300) + ' ...' }
+        $key = $ln
+        if ($seen.ContainsKey($key)) { $seen[$key] = [int]$seen[$key] + 1; continue }
+        if ($hits.Count -ge $MaxHits) { continue }
+        $seen[$key] = 1
+        $null = $hits.Add(("    L{0}: {1}" -f ($i + 1), $ln))
+    }
+    if ($hits.Count -eq 0) { return }
+    Write-Host ("  --- {0} ({1}, 共 {2} 行) ---" -f $Title, (Split-Path $Path -Leaf), $lines.Count) -ForegroundColor DarkYellow
+    foreach ($h in $hits) {
+        $dup = ''
+        $body = $h.Substring($h.IndexOf(': ') + 2)
+        if ($seen.ContainsKey($body) -and [int]$seen[$body] -gt 1) { $dup = ("   ×{0}" -f $seen[$body]) }
+        Write-Host ($h + $dup) -ForegroundColor DarkYellow
+    }
+    $tail = @($lines | Where-Object { $_.Trim().Length -gt 0 } | Select-Object -Last $TailLines)
+    if ($tail.Count -gt 0) {
+        Write-Host ("  --- {0} 尾部 {1} 行 ---" -f (Split-Path $Path -Leaf), $tail.Count) -ForegroundColor DarkGray
+        foreach ($t in $tail) { Write-Host ("    " + $t.Trim()) -ForegroundColor DarkGray }
+    }
+}
+
 # 首次/依赖变更后执行 deepseek-harness 构建(`pnpm run build`), 让门户"装完就能起来"。
 # 未构建就直接启动门户 = 上面那两类错误刷屏, 所以把构建前置到装配阶段。
 # 与 pnpm install 同样: node 直跑 pnpm 入口(绕过 .cmd 包装) + 输出落盘 + 轮询显示最新一行,
@@ -813,12 +854,16 @@ function Invoke-HarnessBuild {
     try { if ($proc.ExitCode -is [int]) { $code = $proc.ExitCode } } catch { }
     if ($code -ne 0 -and $code -eq -1 -and (Test-HarnessBuilt $Harness)) { $code = 0 }
     if ($code -ne 0) {
-        if ($code -eq -1) { Err "deepseek-harness 构建未成功(退出码不可读, 且关键产物缺失)。错误日志尾部:" }
-        else { Err "deepseek-harness 构建失败(退出码 $code)。错误日志尾部:" }
-        @(Get-Content -LiteralPath $e -Tail 15 -ErrorAction SilentlyContinue) +
-        @(Get-Content -LiteralPath $o -Tail 15 -ErrorAction SilentlyContinue) |
-            ForEach-Object { Write-Host ("    " + $_) -ForegroundColor DarkYellow }
-        Err "可手动重试: cd '$Harness' ; pnpm run build"
+        if ($code -eq -1) { Err "deepseek-harness 构建未成功(退出码不可读, 且关键产物缺失)。" }
+        else { Err "deepseek-harness 构建失败(退出码 $code)。" }
+        # 真正的原因通常不在日志尾部: 尾部多是被 fail 链层层上报后的 pnpm ELIFECYCLE 与
+        # Node 崩溃堆栈(build.ts 抛出的 "build: build:lib exited with 1"), 而编译器/打包器
+        # 的第一手错误在中段。所以两类都摘出来, 省得让人去翻几万行日志。
+        Show-LogDiagnostics -Path $o -Title "构建日志(stdout) 关键错误行"
+        Show-LogDiagnostics -Path $e -Title "构建日志(stderr) 关键错误行"
+        Write-Host "    完整日志: $o" -ForegroundColor DarkGray
+        Write-Host "    完整日志: $e" -ForegroundColor DarkGray
+        Err "可手动重试(错误会直接显示在本窗口): cd '$Harness' ; pnpm run build"
         return $false
     }
     if (-not (Test-HarnessBuilt $Harness)) {
