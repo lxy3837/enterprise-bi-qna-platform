@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.7.7 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.7.8 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -97,6 +97,14 @@
 #                      现在构建期间临时往 pnpm-workspace.yaml 追加 verifyDepsBeforeRun:
 #                      false(上游若已自行配置则不动), 构建结束按原始字节还原 —— 构建前
 #                      刚跑过 pnpm install, 这次自检本就是冗余
+#                v2.7.8: 修复"依赖半成品被误判为已就绪, 构建报 'tsx' 不是内部或外部命令"
+#                      —— 依赖就绪判定原来只看 node_modules\tsx 包目录。上一次 install 被
+#                      fs-ext 原生编译失败(v2.7.6)打断在链接阶段时, 会留下"包在、.bin
+#                      命令行 shim 缺"的半成品; 第二次跑脚本判定"已就绪"跳过安装, 而构建
+#                      第一步 `tsx scripts/build.ts` 需要 node_modules\.bin\tsx.cmd, 于是
+#                      整个构建在启动瞬间失败(日志仅 ELIFECYCLE 一行 + tsx 找不到)。
+#                      现在判定同时要求 .bin 下的 tsx shim 存在, 半成品会被识别并重跑
+#                      pnpm install(只补链接, 秒级)
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -939,6 +947,12 @@ function Test-HarnessReady([string]$Harness) {
     if (-not (Test-Path (Join-Path $Harness "node_modules"))) { return $false }
     if (-not (Test-Path (Join-Path $Harness "node_modules\tsx"))) { return $false }
     if (-not (Test-Path (Join-Path $Harness "apps\cli\src\bin.ts"))) { return $false }
+    # 光有包目录不够: node_modules\.bin 下的命令行 shim 是 pnpm 链接阶段的产物。上一次
+    # install 被 fs-ext 原生编译失败打断(v2.7.6)时会留下"包在、shim 缺"的半成品, 而构建
+    # 第一步 `tsx scripts/build.ts` 走的是 .bin\tsx.cmd -> 报 'tsx' 不是内部或外部命令。
+    # 不校验它, 半成品就会被误判为"已就绪"并跳过安装, 构建必然失败
+    $bin = Join-Path $Harness "node_modules\.bin"
+    if (-not ((Test-Path (Join-Path $bin "tsx.cmd")) -or (Test-Path (Join-Path $bin "tsx")))) { return $false }
     return $true
 }
 
