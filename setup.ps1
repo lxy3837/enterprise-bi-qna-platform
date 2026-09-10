@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.6.6 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.6.7 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -25,6 +25,12 @@
 #                      下载/链接"显示; 回显 stderr(corepack 下载/网络错误不再隐形);
 #                      日志长时间无输出时提示"可能在等网络"; 检测到直连 registry.npmjs.org
 #                      时仅对本次安装注入国内镜像(DSH_SETUP_NO_MIRROR=1 可关闭)
+#                v2.6.7: 关闭 corepack 下载 pnpm 版本时的交互询问(COREPACK_ENABLE_DOWNLOAD_PROMPT=0) ——
+#                      后台重定向下"等回车"会永久卡住, 表现为进度条一直转但解析 0 个包一小时;
+#                      启用镜像时同步设置 COREPACK_NPM_REGISTRY(corepack 不读 npm_config_registry);
+#                      解析/等待阶段改用不确定进度(-1), 不再用"百分比在动而计数为 0"的假进度;
+#                      30 秒无任何 pnpm 事件时明确提示"可能在下载 pnpm 版本/等待网络";
+#                      子进程 stdin 改指空文件(corepack 仅在 stdin 为 TTY 时询问), 双重保险
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -64,6 +70,10 @@ $ErrorActionPreference = "Stop"
 # 本脚本大量调用原生命令并以 $LASTEXITCODE 判断成败:
 # 关闭 PS7.3+ "原生 stderr → 终止错误" 的默认行为, 避免告警类 stderr 误伤主流程
 $PSNativeCommandUseErrorActionPreference = $false
+# corepack 首次下载 pnpm/其它包管理器版本时会交互询问 "Do you want to continue? [Y/n]";
+# 本脚本的安装/启动进程都是后台重定向运行的 —— 提示进了日志、也永远等不到回车,
+# 表现为"进度条一直转但解析 0 个包"(像卡死)。这里统一关闭交互询问(自动继续)。
+$env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"
 # 包根目录: 兼容两种启动方式
 #   a) powershell -File setup.ps1  (setup.bat v2.6.3+): $MyInvocation 有脚本路径
 #   b) scriptblock 动态加载运行: 路径为 null, 兜底取当前目录(setup.bat 启动前已 cd /d 到包根)
@@ -341,6 +351,10 @@ function Invoke-PnpmInstallProgress {
     $o = Join-Path $logDir "pnpm-install.out.log"
     $e = Join-Path $logDir "pnpm-install.err.log"
     Remove-Item $o, $e -Force -ErrorAction SilentlyContinue
+    # stdin 指向空文件(而非控制台): corepack 只在 stdin 是 TTY 时才弹交互询问,
+    # 这样即使 corepack 版本不认 COREPACK_ENABLE_DOWNLOAD_PROMPT 也不会挂住等回车
+    $in0 = Join-Path $logDir "pnpm-install.stdin"
+    [IO.File]::WriteAllText($in0, "")
     $js = $null
     if ($PnpmCmd) {
         $wrapDir = Split-Path $PnpmCmd
@@ -377,6 +391,8 @@ function Invoke-PnpmInstallProgress {
         }
         if (-not $regCfg -or $regCfg -match 'registry\.npmjs\.org') {
             $env:npm_config_registry = 'https://registry.npmmirror.com'
+            # corepack 下 pnpm 版本走它自己的变量(不读 npm_config_registry), 一起指到镜像
+            if (-not $env:COREPACK_NPM_REGISTRY) { $env:COREPACK_NPM_REGISTRY = 'https://registry.npmmirror.com' }
             Warn "未检测到自定义 npm 源, 已为本次安装启用国内镜像 registry.npmmirror.com(设置 DSH_SETUP_NO_MIRROR=1 可关闭)"
         }
     }
@@ -405,9 +421,9 @@ function Invoke-PnpmInstallProgress {
         $obtained = New-Object 'System.Collections.Generic.HashSet[string]'
         $imported = New-Object 'System.Collections.Generic.HashSet[string]'
         $lastOut = 0; $lastErr = 0; $spin = 0; $tick = 0; $echoN = 0
-        $stage = ''; $lastGrowAt = 0.0   # 真实阶段(pnpm:stage) 与 日志最后增长时刻(判断"卡死"用)
+        $stage = ''; $lastGrowAt = 0.0; $gotAnyEvent = $false   # 真实阶段 / 日志最后增长时刻 / 是否收到过任何 pnpm 事件
         $sw = [Diagnostics.Stopwatch]::StartNew()
-        $proc = Start-Process -FilePath $NodeExe -ArgumentList $pnpmArgs -WorkingDirectory $WorkDir -RedirectStandardOutput $o -RedirectStandardError $e -NoNewWindow -PassThru
+        $proc = Start-Process -FilePath $NodeExe -ArgumentList $pnpmArgs -WorkingDirectory $WorkDir -RedirectStandardOutput $o -RedirectStandardError $e -RedirectStandardInput $in0 -NoNewWindow -PassThru
         while (-not $proc.HasExited) {
             Start-Sleep -Milliseconds 900
             $spin++; $tick++
@@ -431,6 +447,7 @@ function Invoke-PnpmInstallProgress {
                     ($all.Substring($lastOut)) -split "\r?\n" | ForEach-Object {
                         if (-not $_ -or $_ -match '^\s*$') { return }
                         if ($useNdjson) {
+                            if ($_ -match '"name":"pnpm:') { $gotAnyEvent = $true }
                             if ($_ -match '"name":"pnpm:progress"') {
                                 $st = ''; $id = ''
                                 if ($_ -match '"status":"([a-z_]+)"') { $st = $Matches[1] }
@@ -490,8 +507,12 @@ function Invoke-PnpmInstallProgress {
                 if ($tot -ge 3 -and $done -gt 0) {
                     $pct = [int][math]::Min(99.0, $done * 100.0 / $tot)
                     Write-Progress -Activity $Label -Status ("{0}依赖包 {1}/{2}（已下载 {3} · 已链接 {4}）{5}| 已用时 {6}m{7}s" -f $stageTxt, $done, $tot, $got, $imp, $idleTip, [int]($secs/60), ($secs%60)) -PercentComplete $pct
+                } elseif (-not $gotAnyEvent -and $secs -ge 30) {
+                    # 30s 没有任何 pnpm 事件: 多半 corepack 正在下 pnpm 版本 / 网络不通, 而不是在解析
+                    Write-Progress -Activity $Label -Status ("pnpm 尚未开始输出（可能在下载 pnpm 版本或等待网络, 见下方 [stderr] 与日志）| 已用时 {0}m{1}s" -f [int]($secs/60), ($secs%60)) -PercentComplete -1
                 } else {
-                    Write-Progress -Activity $Label -Status ("{0}已解析 {1} 个包（pnpm 解析大工程较久, 静默属正常）{2}| 已用时 {3}m{4}s" -f $stageTxt, $tot, $idleTip, [int]($secs/60), ($secs%60)) -PercentComplete ($spin % 100)
+                    # 解析阶段总量未知: 用不确定进度(-1), 避免"百分比在动但计数为 0"的误导
+                    Write-Progress -Activity $Label -Status ("{0}已解析 {1} 个包（pnpm 解析大工程较久, 静默属正常）{2}| 已用时 {3}m{4}s" -f $stageTxt, $tot, $idleTip, [int]($secs/60), ($secs%60)) -PercentComplete -1
                 }
             } else {
                 # 兜底: 体积估算(每 3 tick 量一次, 递归枚举大目录较费 IO)
@@ -505,7 +526,7 @@ function Invoke-PnpmInstallProgress {
                 if ($real -ge 1) {
                     Write-Progress -Activity $Label -Status ("已下载约 {0} MB / 预估 1.5 GB | 已用时 {1}m{2}s" -f $mb, [int]($secs/60), ($secs%60)) -PercentComplete $real
                 } else {
-                    Write-Progress -Activity $Label -Status ("解析依赖/连接源中(此阶段下载量常为 0, 属正常) | 已用时 {0}m{1}s" -f [int]($secs/60), ($secs%60)) -PercentComplete ($spin % 100)
+                    Write-Progress -Activity $Label -Status ("解析依赖/连接源中(此阶段下载量常为 0, 属正常){0}| 已用时 {1}m{2}s" -f $idleTip, [int]($secs/60), ($secs%60)) -PercentComplete -1
                 }
             }
         }
