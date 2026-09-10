@@ -49,13 +49,23 @@
 #                      返回 $null, 直接喂给 [regex]::Match 会报 "值不能为 null。参数名: input";
 #                      门户启动前的复用检查(上次失败留下 0 字节 dsh-web.out.log)与镜像探测
 #                      (空 .npmrc)两处都改为先取回文本、判空后再匹配
+#                v2.7.2: 装配阶段补上"构建"这一环 —— 只 pnpm install 而不 build 时, 各包
+#                      lib\*.js / lib\client.js 与 apps/web/dist 都不存在, 门户起来后必然刷屏:
+#                      plugin degraded (import) Cannot find module ...\@deepseek-ai\dsh-settings\
+#                      lib\index.js、client-modules: 45 client packages failed to compose:
+#                      client bundles not found; run `pnpm run build` before launch;
+#                      现在 3/6 在依赖装完后自动执行 pnpm run build(后台 + 实时进度 + 300 秒
+#                      静默看门狗, DSH_SETUP_BUILD_STALL_SECS 可放宽/设 0 关闭),
+#                      启动门户前再校验构建产物(上游构建记录 .dsh-build\client-build-environment.json
+#                      + apps\web\dist + host/client 代表包 lib), 缺失则明确提示而不是硬启动
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
 #    MySQL     : 探测 127.0.0.1:3306 TCP 是否可达(服务在跑即算有)
 #    Node/pnpm : 仅"dsh 图形门户"需要; 3/6 自动定位/下载便携 Node(zip)
 #                并用 npm 装 pnpm; harness 与 ~/.dsh/profiles/web 缺依赖时自动
-#                pnpm install(需联网, harness≈1.5GB, 插件层数百 MB)
+#                pnpm install(需联网, harness≈1.5GB, 插件层数百 MB),
+#                harness 首次还会自动 pnpm run build(生成各包 lib 与 apps/web/dist)
 #    winget    : 仅作官网下载失败的兜底通道(非必需)
 #
 #  自动下载开关(均需联网; 版本/URL 于 2026-09 实测可达):
@@ -304,6 +314,12 @@ function Start-DshPortal {
     if (-not (Test-HarnessReady $Harness)) {
         Err "deepseek-harness 依赖不完整(缺 node_modules 或不含 tsx), 无法启动门户。"
         Err "选 [F] 或重跑 setup.bat -Product 会自动补齐依赖; 也可手动: cd '$Harness' ; pnpm install"
+        return
+    }
+    if (-not (Test-HarnessBuilt $Harness)) {
+        Err "deepseek-harness 尚未构建(缺各包 lib\*.js 或 apps\web\dist), 无法启动门户。"
+        Err "现在强行启动只会看到 plugin degraded (import) 与 client bundles not found;"
+        Err "选 [F]/[D] 或重跑 setup.bat -Product 会自动构建; 也可手动: cd '$Harness' ; pnpm run build"
         return
     }
     $nodeExe = Ensure-NodeRuntime
@@ -688,6 +704,131 @@ function Test-HarnessReady([string]$Harness) {
     return $true
 }
 
+# 门户运行时是否"已构建" —— 只有依赖(node_modules)是不够的:
+# 启动命令(node --import tsx/esm apps/cli/src/bin.ts web)加载的每个包, 以及浏览器侧 bundle,
+# 都来自 `pnpm run build`(= build:lib + build:web)。全新机器只做过 pnpm install 时,
+# 各包 lib\*.js 与 apps\web\dist 都不存在, 门户启动后会刷屏这类错误:
+#   1) plugin degraded (import): ... Cannot find module '...\@deepseek-ai\dsh-settings\lib\index.js'
+#   2) failed to apply loader entry modules: client-modules: 45 client packages failed to compose:
+#      client bundles not found; run `pnpm run build` before launch
+# 判定取样 5 处(上游自己的构建记录 + host/client/web 三侧代表产物), 毫秒级, 不遍历全仓。
+function Test-HarnessBuilt([string]$Harness) {
+    if (-not (Test-Path (Join-Path $Harness ".dsh-build\client-build-environment.json"))) { return $false }
+    if (-not (Test-Path (Join-Path $Harness "apps\web\dist\index.html"))) { return $false }
+    if (-not (Test-Path (Join-Path $Harness "vendor\cordis\lib\index.js"))) { return $false }
+    if (-not (Test-Path (Join-Path $Harness "packages\settings\settings\lib\index.js"))) { return $false }
+    if (-not (Test-Path (Join-Path $Harness "packages\client\modules\lib\client.js"))) { return $false }
+    return $true
+}
+
+# 首次/依赖变更后执行 deepseek-harness 构建(`pnpm run build`), 让门户"装完就能起来"。
+# 未构建就直接启动门户 = 上面那两类错误刷屏, 所以把构建前置到装配阶段。
+# 与 pnpm install 同样: node 直跑 pnpm 入口(绕过 .cmd 包装) + 输出落盘 + 轮询显示最新一行,
+# 并带静默看门狗(默认 300 秒无任何输出判定卡死; DSH_SETUP_BUILD_STALL_SECS 放宽, 设 0 关闭)。
+function Invoke-HarnessBuild {
+    param([string]$Harness)
+    if (Test-HarnessBuilt $Harness) {
+        Ok "deepseek-harness 构建产物已就绪(各包 lib + apps/web/dist), 跳过构建"
+        return $true
+    }
+    Warn "deepseek-harness 尚未构建(缺各包 lib\*.js / lib\client.js / apps\web\dist)。"
+    Warn "不构建直接启动门户会报 plugin degraded / client bundles not found; 现在开始构建(纯本地编译, 首次约 3-10 分钟) ..."
+    $nodeExe = Ensure-NodeRuntime
+    if (-not $nodeExe) { Err "node 不可用, 无法构建门户运行时"; return $false }
+    $pnpm = Ensure-Pnpm $nodeExe
+    if (-not $pnpm) { Err "pnpm 不可用, 无法构建门户运行时(可手动: cd '$Harness' ; pnpm run build)"; return $false }
+    $logDir = Join-Path $RUNTIME "logs"
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $o = Join-Path $logDir "harness-build.out.log"
+    $e = Join-Path $logDir "harness-build.err.log"
+    Remove-Item $o, $e -Force -ErrorAction SilentlyContinue
+    # 与安装一致: 找 pnpm 真实 js 入口, 找不到则降级前台直跑(build 输出直接留在本窗口)
+    $js = $null
+    $wrapDir = Split-Path $pnpm
+    $c1 = Join-Path $wrapDir "node_modules\pnpm\bin\pnpm.cjs"
+    if (Test-Path $c1) { $js = $c1 }
+    if (-not $js) {
+        $c2 = Join-Path $wrapDir "node_modules\corepack\dist\pnpm.js"
+        if (Test-Path $c2) { $js = $c2 }
+    }
+    if (-not $js) {
+        Push-Location $Harness
+        try { & $pnpm run build }
+        finally { Pop-Location }
+        if ($LASTEXITCODE -eq 0 -and (Test-HarnessBuilt $Harness)) { Ok "deepseek-harness 构建完成(各包 lib + apps/web/dist 已生成)"; return $true }
+        Err "deepseek-harness 构建失败, 可手动重试: cd '$Harness' ; pnpm run build"
+        return $false
+    }
+    $in0 = Join-Path $logDir "pnpm-install.stdin"
+    [IO.File]::WriteAllText($in0, "")
+    $stallSecs = 300
+    if ($env:DSH_SETUP_BUILD_STALL_SECS -match '^\d+$') { $stallSecs = [int]$env:DSH_SETUP_BUILD_STALL_SECS }
+    Write-Host ("  正在构建 deepseek-harness(pnpm run build), 详细日志: {0}" -f $o) -ForegroundColor DarkGray
+    $proc = Start-Process -FilePath $nodeExe -ArgumentList @($js, 'run', 'build') -WorkingDirectory $Harness `
+        -RedirectStandardOutput $o -RedirectStandardError $e -RedirectStandardInput $in0 -NoNewWindow -PassThru
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $lenO = 0; $lenE = 0; $lastAny = 0.0; $lastPrinted = ''; $killed = $false; $hinted = $false
+    while (-not $proc.HasExited) {
+        Start-Sleep -Milliseconds 900
+        $grew = $false
+        foreach ($f in @($o, $e)) {
+            if (-not (Test-Path $f)) { continue }
+            $txt = Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue
+            if (-not $txt) { continue }
+            $prev = if ($f -eq $o) { $lenO } else { $lenE }
+            if ($txt.Length -gt $prev) {
+                $grew = $true
+                # 构建输出很密, 只回显本次新增内容里最后一行非空行(相当于实时进度)
+                $newLines = @(($txt.Substring($prev)) -split "\r?\n" | Where-Object { $_ -and $_ -notmatch '^\s*$' })
+                if ($newLines.Count -gt 0) {
+                    $line = $newLines[-1].Trim()
+                    if ($line -ne $lastPrinted -and $line.Length -le 200) {
+                        Write-Host ("    [build] " + $line) -ForegroundColor DarkGray
+                        $lastPrinted = $line
+                    }
+                }
+            }
+            if ($f -eq $o) { $lenO = $txt.Length } else { $lenE = $txt.Length }
+        }
+        if ($grew) { $lastAny = $sw.Elapsed.TotalSeconds; $hinted = $false }
+        $quiet = $sw.Elapsed.TotalSeconds - $lastAny
+        if ($stallSecs -gt 0 -and -not $hinted -and $quiet -ge ($stallSecs / 2)) {
+            $hinted = $true
+            Write-Host ("    （构建已 {0} 秒无新输出, 仍在编译中; 到达 {1} 秒无输出才会判定卡死）" -f [int]$quiet, $stallSecs) -ForegroundColor DarkGray
+        }
+        if ($stallSecs -gt 0 -and $quiet -ge $stallSecs) {
+            $killed = $true
+            Err ("deepseek-harness 构建已连续 {0} 秒无任何输出, 判定卡死 -> 已自动终止。" -f [int]$quiet)
+            Err "可放宽或关闭看门狗后重跑: `$env:DSH_SETUP_BUILD_STALL_SECS=`"600`" (设 0 关闭)"
+            try { Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\taskkill.exe') -ArgumentList @('/PID', $proc.Id, '/T', '/F') -NoNewWindow -Wait -ErrorAction SilentlyContinue } catch { }
+            try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+            break
+        }
+    }
+    if ($killed) { return $false }
+    $proc.WaitForExit()   # 确保输出管道/句柄全部关闭后再判定
+    # 退出码: 多数宿主 WaitForExit 后可正常读取; 个别 PS5.1 环境配重定向时它恒为 $null
+    # (实测), 此时记 -1 并交由下方"产物是否齐全"兜底复核, 绝不能因 $null 就误判构建失败。
+    $code = -1
+    try { if ($proc.ExitCode -is [int]) { $code = $proc.ExitCode } } catch { }
+    if ($code -ne 0 -and $code -eq -1 -and (Test-HarnessBuilt $Harness)) { $code = 0 }
+    if ($code -ne 0) {
+        if ($code -eq -1) { Err "deepseek-harness 构建未成功(退出码不可读, 且关键产物缺失)。错误日志尾部:" }
+        else { Err "deepseek-harness 构建失败(退出码 $code)。错误日志尾部:" }
+        @(Get-Content -LiteralPath $e -Tail 15 -ErrorAction SilentlyContinue) +
+        @(Get-Content -LiteralPath $o -Tail 15 -ErrorAction SilentlyContinue) |
+            ForEach-Object { Write-Host ("    " + $_) -ForegroundColor DarkYellow }
+        Err "可手动重试: cd '$Harness' ; pnpm run build"
+        return $false
+    }
+    if (-not (Test-HarnessBuilt $Harness)) {
+        Err "构建进程正常退出, 但关键产物仍缺失(.dsh-build / apps\web\dist / 各包 lib); 请查看日志: $o"
+        return $false
+    }
+    Ok "deepseek-harness 构建完成(各包 lib + apps/web/dist 已生成)"
+    return $true
+}
+
 # 确保 dsh 门户运行时(deepseek-harness)就绪: 缺源码时按需联网获取(git 浅克隆或官方 zip),
 # 缺 node_modules 时自动 pnpm install。该引擎是第三方上游工程(源码数百 MB + 依赖≈1.5GB),
 # 为控制仓库体积未内置; 等价宿主/评测不需要它。
@@ -697,70 +838,81 @@ function Invoke-HarnessBootstrap {
     $h = Join-Path $ROOT "deepseek-harness"
     $hasSrc = Test-Path (Join-Path $h "package.json")
     $hasMod = Test-Path (Join-Path $h "node_modules")
-    if ($hasSrc -and (Test-HarnessReady $h)) { Ok "deepseek-harness 依赖已就绪(node_modules + tsx 校验通过), 跳过安装"; return $true }
-    if ($hasSrc) {
-        if ($hasMod) { Warn "deepseek-harness 的 node_modules 不完整(上次安装被中断?), 重新 pnpm install 补齐 ..." }
-        else { Warn "deepseek-harness 缺少 node_modules, 开始自动安装门户依赖(需联网, 下载约 1.5GB, 可能 10-20 分钟) ..." }
-    } else {
-        # 源码缺失 -> 询问/自动获取
-        if (-not $FetchIfMissing) {
-            Warn "未找到 deepseek-harness 源码(等价宿主/评测无需)。选 [F]/[D] 启动门户时会自动联网获取; -Product 模式全程自动"
+    # 依赖(node_modules + tsx)与构建产物(lib + apps/web/dist)是两件事:
+    # 前者决定"能不能装", 后者决定"能不能起来"。已就绪时跳过安装, 但仍要走下面的构建校验。
+    $depsReady = ($hasSrc -and (Test-HarnessReady $h))
+    if ($depsReady) { Ok "deepseek-harness 依赖已就绪(node_modules + tsx 校验通过), 跳过安装" }
+    if (-not $depsReady) {
+        if ($hasSrc) {
+            if ($hasMod) { Warn "deepseek-harness 的 node_modules 不完整(上次安装被中断?), 重新 pnpm install 补齐 ..." }
+            else { Warn "deepseek-harness 缺少 node_modules, 开始自动安装门户依赖(需联网, 下载约 1.5GB, 可能 10-20 分钟) ..." }
+        } else {
+            # 源码缺失 -> 询问/自动获取
+            if (-not $FetchIfMissing) {
+                Warn "未找到 deepseek-harness 源码(等价宿主/评测无需)。选 [F]/[D] 启动门户时会自动联网获取; -Product 模式全程自动"
+                return $false
+            }
+            if (-not $Product) {
+                if ([Console]::IsInputRedirected) { Warn "非交互终端且未启用 -Product, 跳过自动获取门户运行时"; return $false }
+                $ans = (Read-Host "  将联网获取 dsh 门户运行时 deepseek-harness(官方上游, 源码+依赖约 1-2GB, 需 10-20 分钟)。继续? [Y/n]").Trim()
+                if ($ans -ne "" -and $ans -ne "Y" -and $ans -ne "y") { Warn "已跳过, 等价宿主/评测仍可用"; return $false }
+            }
+            $repoBase = if ($env:HARNESS_REPO) { $env:HARNESS_REPO.TrimEnd('.git','/') } else { "https://github.com/deepseek-ai/deepseek-harness" }
+            $branch   = if ($env:HARNESS_BRANCH) { $env:HARNESS_BRANCH } else { "master" }
+            $git = (Get-Command git -ErrorAction SilentlyContinue).Source
+            if ($git) {
+                # 上次中断(如 clone 途中被 NativeCommandError 打断)会留下残缺目录, 先清掉再克隆
+                if (Test-Path $h) {
+                    Warn "检测到残留的 deepseek-harness 目录(无 package.json), 清理后重新获取 ..."
+                    try { Remove-Item $h -Recurse -Force -ErrorAction Stop }
+                    catch { Err "残留目录无法删除($h), 请手动删除后重试"; return $false }
+                }
+                Warn "自动克隆 deepseek-harness($branch, 浅克隆, 联网下载源码; 进度显示在本窗口) ..."
+                # PS5.1 陷阱(同 mysqld 初始化): git 的进度信息走 stderr, 若用 2>&1 合并进管道,
+                # 在 EAP=Stop 下每条 stderr 都会被当成 NativeCommandError 致命错误逐行中断。
+                # 解决: 不合并 stderr(直接上屏), 调用期临时把 EAP 降为 Continue, 成败只看退出码。
+                $eapSave = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+                & $git clone --depth 1 --branch $branch "$repoBase.git" $h
+                $cloneCode = $LASTEXITCODE
+                $ErrorActionPreference = $eapSave
+                if ($cloneCode -ne 0) { Err "git clone 失败(退出码 $cloneCode), 请检查网络/代理后重试"; return $false }
+            } else {
+                Warn "未检测到 git, 改为直接下载官方 zip 并解压..."
+                $zip = Join-Path $RUNTIME "deepseek-harness.zip"
+                $tmp = Join-Path $RUNTIME "harness-unzip"
+                try {
+                    Invoke-WebRequest -Uri "$repoBase/archive/refs/heads/$branch.zip" -OutFile $zip -UseBasicParsing
+                    if ((Get-Item $zip).Length -lt 100KB) { throw "下载被拦截或文件异常(大小过小)" }
+                    if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+                    Expand-Archive -Path $zip -DestinationPath $tmp
+                    $dir = Get-ChildItem -Path $tmp -Directory -Filter "deepseek-harness*" | Select-Object -First 1
+                    if (-not $dir) { throw "zip 解压后未找到 deepseek-harness 目录" }
+                    if (Test-Path $h) { Remove-Item $h -Recurse -Force }
+                    Move-Item $dir.FullName $h
+                } catch { Err "自动获取 deepseek-harness 失败: $($_.Exception.Message)"; return $false }
+            }
+            if (-not (Test-Path (Join-Path $h "package.json"))) { Err "获取 deepseek-harness 失败, 请检查网络后重试(或手动放置该目录)"; return $false }
+            Ok "deepseek-harness 源码已就绪($h)"
+        }
+        # 依赖安装
+        $nodeExe = Ensure-NodeRuntime
+        if (-not $nodeExe) { Warn "未检测到 node, 自动下载便携版(约 36MB)..."; $nodeExe = Install-PortableNode }
+        if (-not $nodeExe) { Err "node 获取失败, 无法安装门户依赖"; return $false }
+        $pnpm = Ensure-Pnpm $nodeExe
+        if (-not $pnpm) { Err "pnpm 安装失败, 请手动执行 npm install -g pnpm 后重跑"; return $false }
+        Ok "node $(& $nodeExe --version 2>$null) / pnpm $(& $pnpm --version 2>$null)"
+        if (-not (Invoke-PnpmInstallProgress -WorkDir $h -PnpmCmd $pnpm -NodeExe $nodeExe -Label "deepseek-harness 依赖安装 (pnpm install)")) {
+            Err "deepseek-harness 依赖安装失败, 门户暂不可启动(等价宿主/评测不受影响)。可重跑本脚本或手动: cd '$h' ; pnpm install"
             return $false
         }
-        if (-not $Product) {
-            if ([Console]::IsInputRedirected) { Warn "非交互终端且未启用 -Product, 跳过自动获取门户运行时"; return $false }
-            $ans = (Read-Host "  将联网获取 dsh 门户运行时 deepseek-harness(官方上游, 源码+依赖约 1-2GB, 需 10-20 分钟)。继续? [Y/n]").Trim()
-            if ($ans -ne "" -and $ans -ne "Y" -and $ans -ne "y") { Warn "已跳过, 等价宿主/评测仍可用"; return $false }
-        }
-        $repoBase = if ($env:HARNESS_REPO) { $env:HARNESS_REPO.TrimEnd('.git','/') } else { "https://github.com/deepseek-ai/deepseek-harness" }
-        $branch   = if ($env:HARNESS_BRANCH) { $env:HARNESS_BRANCH } else { "master" }
-        $git = (Get-Command git -ErrorAction SilentlyContinue).Source
-        if ($git) {
-            # 上次中断(如 clone 途中被 NativeCommandError 打断)会留下残缺目录, 先清掉再克隆
-            if (Test-Path $h) {
-                Warn "检测到残留的 deepseek-harness 目录(无 package.json), 清理后重新获取 ..."
-                try { Remove-Item $h -Recurse -Force -ErrorAction Stop }
-                catch { Err "残留目录无法删除($h), 请手动删除后重试"; return $false }
-            }
-            Warn "自动克隆 deepseek-harness($branch, 浅克隆, 联网下载源码; 进度显示在本窗口) ..."
-            # PS5.1 陷阱(同 mysqld 初始化): git 的进度信息走 stderr, 若用 2>&1 合并进管道,
-            # 在 EAP=Stop 下每条 stderr 都会被当成 NativeCommandError 致命错误逐行中断。
-            # 解决: 不合并 stderr(直接上屏), 调用期临时把 EAP 降为 Continue, 成败只看退出码。
-            $eapSave = $ErrorActionPreference; $ErrorActionPreference = "Continue"
-            & $git clone --depth 1 --branch $branch "$repoBase.git" $h
-            $cloneCode = $LASTEXITCODE
-            $ErrorActionPreference = $eapSave
-            if ($cloneCode -ne 0) { Err "git clone 失败(退出码 $cloneCode), 请检查网络/代理后重试"; return $false }
-        } else {
-            Warn "未检测到 git, 改为直接下载官方 zip 并解压..."
-            $zip = Join-Path $RUNTIME "deepseek-harness.zip"
-            $tmp = Join-Path $RUNTIME "harness-unzip"
-            try {
-                Invoke-WebRequest -Uri "$repoBase/archive/refs/heads/$branch.zip" -OutFile $zip -UseBasicParsing
-                if ((Get-Item $zip).Length -lt 100KB) { throw "下载被拦截或文件异常(大小过小)" }
-                if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
-                Expand-Archive -Path $zip -DestinationPath $tmp
-                $dir = Get-ChildItem -Path $tmp -Directory -Filter "deepseek-harness*" | Select-Object -First 1
-                if (-not $dir) { throw "zip 解压后未找到 deepseek-harness 目录" }
-                if (Test-Path $h) { Remove-Item $h -Recurse -Force }
-                Move-Item $dir.FullName $h
-            } catch { Err "自动获取 deepseek-harness 失败: $($_.Exception.Message)"; return $false }
-        }
-        if (-not (Test-Path (Join-Path $h "package.json"))) { Err "获取 deepseek-harness 失败, 请检查网络后重试(或手动放置该目录)"; return $false }
-        Ok "deepseek-harness 源码已就绪($h)"
+        Ok "deepseek-harness 依赖安装完成"
     }
-    # 依赖安装
-    $nodeExe = Ensure-NodeRuntime
-    if (-not $nodeExe) { Warn "未检测到 node, 自动下载便携版(约 36MB)..."; $nodeExe = Install-PortableNode }
-    if (-not $nodeExe) { Err "node 获取失败, 无法安装门户依赖"; return $false }
-    $pnpm = Ensure-Pnpm $nodeExe
-    if (-not $pnpm) { Err "pnpm 安装失败, 请手动执行 npm install -g pnpm 后重跑"; return $false }
-    Ok "node $(& $nodeExe --version 2>$null) / pnpm $(& $pnpm --version 2>$null)"
-    if (-not (Invoke-PnpmInstallProgress -WorkDir $h -PnpmCmd $pnpm -NodeExe $nodeExe -Label "deepseek-harness 依赖安装 (pnpm install)")) {
-        Err "deepseek-harness 依赖安装失败, 门户暂不可启动(等价宿主/评测不受影响)。可重跑本脚本或手动: cd '$h' ; pnpm install"
+    # 构建: 只装依赖不构建, 门户起来后会报 plugin degraded (import) / client bundles not found
+    if (-not (Invoke-HarnessBuild -Harness $h)) {
+        Err "deepseek-harness 未构建成功, 门户暂不可启动(等价宿主/评测不受影响)。可手动: cd '$h' ; pnpm run build"
         return $false
     }
-    Ok "deepseek-harness 依赖安装完成。选 [F] 即可一键启动门户并自动打开浏览器"
+    Ok "deepseek-harness 已就绪(依赖 + 构建产物)。选 [F] 即可一键启动门户并自动打开浏览器"
     return $true
 }
 
