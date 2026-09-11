@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.7.8 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.7.9 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -105,6 +105,16 @@
 #                      整个构建在启动瞬间失败(日志仅 ELIFECYCLE 一行 + tsx 找不到)。
 #                      现在判定同时要求 .bin 下的 tsx shim 存在, 半成品会被识别并重跑
 #                      pnpm install(只补链接, 秒级)
+#                v2.7.9: 修复"机器上已有旧 node 时, 门户依赖/构建必然失败" ——
+#                      node 定位原来只看 PATH 里"有没有 node", 不看版本, 且 .runtime 便携版
+#                      只在 PATH 完全没有 node 时才启用。同事机器上/其它软件装的旧 node
+#                      常占着 PATH, 而 pnpm 11+ 要求 node >= 22.13, 典型症状:
+#                        隔离安装的 pnpm 探测版本为空 → 误判"版本不符(现 , 期望 11.7.0)"
+#                        → 退回全局安装 → node.exe: ERROR: This version of pnpm
+#                        requires at least Node.js v22.13
+#                      现在按版本选 node: 优先"达标"的 PATH node → .runtime 便携版
+#                      (v$NODE_VERSION, 达标即复用) → 都不达标则下载便携版; 只有确实拿不到
+#                      达标 node 时才退回旧版并给出明确告警
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -170,6 +180,10 @@ $PY_EXE_URL   = "https://www.python.org/ftp/python/$PY_VERSION/$PY_EXE_NAME"
 $NODE_VERSION = "v24.21.0"
 $NODE_ZIP_NAME = "node-$NODE_VERSION-win-x64.zip"
 $NODE_ZIP_URL  = "https://nodejs.org/dist/$NODE_VERSION/$NODE_ZIP_NAME"
+# 门户所需 node 下限: pnpm 11+ 启动即校验, 低于它直接报
+# "This version of pnpm requires at least Node.js v22.13"。机器上已有旧 node 时必须改用
+# .runtime 便携版, 否则 pnpm 装得上却跑不起来(详见 Ensure-NodeRuntime)
+$NODE_MIN_VERSION = "22.13"
 # MySQL: 官方 8.0 ZIP 便携版 (注意: dev.mysql.com/get 网关常 403, 优先 CDN 直链)
 $MYSQL_ZIP_NAME = "mysql-8.0.45-winx64.zip"
 $MYSQL_ZIP_URLS = @(
@@ -440,6 +454,10 @@ function Restore-FileBytes([string]$Path, $Bytes) {
 # $Wanted = 上游 pin 的 pnpm 版本。版本不符必须换成同版本, 否则 `pnpm run` 必失败;
 # 优先隔离安装到 .runtime(不动用户的全局 pnpm, 也不依赖写权限), 失败才退回全局安装
 function Ensure-Pnpm([string]$NodeExe, [string]$Wanted = '') {
+    # pnpm.cmd/.ps1 是 shim, 内部按 PATH 找 `node`; 机器上若有个旧 node 排在前面, 探测版本
+    # 会执行失败(返回空)并被误判成"版本不符"。先把选定 node 的目录前置, 保证探测与运行
+    # 用的都是同一个达标 node
+    Add-ToolDirsToPath $NodeExe ''
     $pnpm = (Get-Command pnpm -ErrorAction SilentlyContinue).Source
     $cur = Get-PnpmVersion $pnpm
     if ($pnpm -and (Test-PnpmSatisfies $cur $Wanted)) { return $pnpm }
@@ -497,15 +515,49 @@ function New-DshPatch {
     return $out
 }
 
-# 定位 node: PATH → 用户级安装 → .runtime 便携; AutoInstall 时自动下载便携版
+# 取 node 版本(去掉前缀 v, 形如 "24.21.0"); 命令不存在/执行失败返回空串
+function Get-NodeVersion([string]$NodeExe) {
+    if (-not $NodeExe) { return '' }
+    try {
+        $v = (& $NodeExe --version 2>$null | Select-Object -First 1)
+        if (-not $v) { return '' }
+        return ("$v").Trim().TrimStart('v', 'V')
+    } catch { return '' }
+}
+
+# node 是否达到门户所需下限。解析不了就不拦(交给后续步骤报真实错误), 避免误判把可用环境换掉
+function Test-NodeSatisfies([string]$Version, [string]$Min = '') {
+    if (-not $Version) { return $false }
+    $m = if ($Min) { $Min } else { $NODE_MIN_VERSION }
+    try {
+        $v = [version](($Version -replace '^[vV]', '').Trim())
+        $t = [version]$m
+        return ($v -ge $t)
+    } catch { return $true }
+}
+
+# 定位 node: 优先"版本达标"的 PATH node → .runtime 便携 node → AutoInstall 时下载便携版。
+# 只看"有没有 node"是不够的: 机器上(或其它软件)装的旧 node 常占着 PATH, 而 pnpm 11+ 要求
+# node >= 22.13, 用旧 node 跑 pnpm 会报 "This version of pnpm requires at least
+# Node.js v22.13"; 且旧 node 下 pnpm 的 --version 探测为空, 会被误判成"版本不符"。
 function Ensure-NodeRuntime {
     $ne = (Get-Command node -ErrorAction SilentlyContinue).Source
-    if (-not $ne) { $ne = Find-PortableNode }
-    if (-not $ne -and $AutoInstall) {
-        Warn "未检测到 node, 自动下载官方 Node $NODE_VERSION 便携包到 .runtime (约 36MB)..."
-        $ne = Install-PortableNode
+    $nv = Get-NodeVersion $ne
+    if ($ne -and (Test-NodeSatisfies $nv)) { return $ne }
+    if ($ne) { Warn "PATH 中的 node v$nv 低于门户所需下限 v$NODE_MIN_VERSION, 改用 .runtime 便携版" }
+    $pn = Find-PortableNode
+    if ($pn) {
+        $pv = Get-NodeVersion $pn
+        if (Test-NodeSatisfies $pv) { return $pn }
+        Warn ".runtime 已有便携 node v$pv 但仍低于下限 v$NODE_MIN_VERSION"
     }
-    return $ne
+    if ($AutoInstall) {
+        Warn "自动下载官方 Node $NODE_VERSION 便携包到 .runtime (约 36MB)..."
+        $dl = Install-PortableNode
+        if ($dl) { return $dl }
+    }
+    if ($ne) { Warn "未能取得达标 node, 仍用旧版 node v$nv(门户相关步骤可能失败)"; return $ne }
+    return $null
 }
 
 # 解析 dsh 门户本机地址(广告/第三方域名绝不参与匹配):
@@ -1421,11 +1473,16 @@ else {
 # 与 Ensure-NodeRuntime 保持同一套判定(PATH -> .runtime 便携; 此处只探测不下载),
 # 否则会出现"这里说未检测到 node, 后面却用着 .runtime 里的 v24.x 便携版"的矛盾提示
 $nodeExe0 = (Get-Command node -ErrorAction SilentlyContinue).Source
+$nodeVer0 = Get-NodeVersion $nodeExe0
 $nodeIsPortable = $false
-if (-not $nodeExe0) { $nodeExe0 = Find-PortableNode; if ($nodeExe0) { $nodeIsPortable = $true } }
+# 与 Ensure-NodeRuntime 同一套判定: 只看"有没有 node"会漏掉"有但是旧版"(pnpm 11+ 要求
+# node >= 22.13)。PATH 里的 node 不达标时, 先看 .runtime 是否已有达标的便携版
+if (-not ($nodeExe0 -and (Test-NodeSatisfies $nodeVer0))) {
+    $pn0 = Find-PortableNode
+    if ($pn0) { $nodeExe0 = $pn0; $nodeVer0 = Get-NodeVersion $pn0; $nodeIsPortable = $true }
+}
 if ($nodeExe0) {
-    $nv = (& $nodeExe0 --version 2>$null | Select-Object -First 1)
-    if ($nodeIsPortable) { Ok "node $nv (便携版, 已解压于 .runtime\nodejs)" } else { Ok "node $nv" }
+    if ($nodeIsPortable) { Ok "node v$nodeVer0 (便携版, 已解压于 .runtime\nodejs)" } else { Ok "node v$nodeVer0" }
 } else { Warn "未检测到 node(仅 dsh 图形门户需要, 后续会自动下载便携版)" }
 $pnpmOk = [bool](Get-Command pnpm -ErrorAction SilentlyContinue)
 if ($pnpmOk) { Ok "pnpm $(pnpm --version 2>$null)" } else { Warn "未检测到 pnpm(仅 dsh 图形门户需要, 后续会用 npm 自动安装)" }
