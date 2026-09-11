@@ -1,6 +1,6 @@
 ﻿#============================================================
 #  平台化企业智能问数工作台 - 一键配置 (setup.bat 调用的主逻辑)
-#  版本: v2.7.9 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
+#  版本: v2.8.0 - 产品模式: 门户一键(在线装配插件 + 后台启动 + 自动开浏览器)
 #                幂等: 双库已初始化时用只读账号探活即跳过建库(root 密码不再反复询问)
 #                v2.5: MySQL/Node 下载走多镜像(官方CDN+华为云+清华)并校验 ZIP 魔数,
 #                      网关把下载换成 HTML 拦截页时自动换镜像重试, 不再解压报错中断
@@ -115,6 +115,17 @@
 #                      现在按版本选 node: 优先"达标"的 PATH node → .runtime 便携版
 #                      (v$NODE_VERSION, 达标即复用) → 都不达标则下载便携版; 只有确实拿不到
 #                      达标 node 时才退回旧版并给出明确告警
+#                v2.8.0: 接 v2.7.9, 修复"旧 node 机器上体检阶段就崩" —— node 选择虽已按版本
+#                      改, 但 0/6 体检里那行 `pnpm --version` 还在, 且 PATH 上的 pnpm 常是
+#                      npm 全局目录里的 .ps1 shim: 它在当前会话内执行并调用 PATH 里的 node,
+#                      机器上 node 太旧时抛 NativeCommandError, EAP=Stop 下整个脚本在体检
+#                      阶段直接退出(实测 node v16.19.0 + 上一轮被装成的全局 pnpm 11 ->
+#                      "This version of pnpm requires at least Node.js v22.13")。
+#                      现在: 1) 新增 Resolve-PnpmCmd, 优先取 .cmd(独立子进程, 失败也只是
+#                      非零退出码, 不会带崩宿主会话), 体检与 Ensure-Pnpm 都改用它, 版本探测
+#                      统一走带 try/catch 的 Get-PnpmVersion, 探不到只提示不终止;
+#                      2) 体检阶段 node 低于下限时明确告警(此前只静默显示版本号);
+#                      3) 全局安装 pnpm 的兜底也包上 try/catch
 #
 #  环境识别(不以 PATH 命令为准, 避免装了服务但无命令行工具被误判):
 #    Python    : 依次找 PATH python / py 启动器 / 常见安装目录
@@ -314,6 +325,22 @@ function Get-PnpmVersion([string]$PnpmCmd) {
     } catch { return '' }
 }
 
+# 解析 pnpm 命令行入口。PATH 上通常同时有 pnpm.cmd 与 pnpm.ps1(npm 全局目录), Get-Command
+# 可能先返回 .ps1 shim —— 它在当前会话内执行、依赖 PATH 里的 node, 机器上 node 太旧时会抛
+# NativeCommandError, 在 $ErrorActionPreference='Stop' 下直接终止整个脚本(实测见 v2.8.0)。
+# 优先取 .cmd: 独立子进程执行, 失败也只是非零退出码, 不会把宿主会话带崩。
+function Resolve-PnpmCmd {
+    try {
+        $all = @(Get-Command pnpm -All -ErrorAction SilentlyContinue)
+        if ($all.Count -eq 0) { return '' }
+        foreach ($ext in @('\.cmd$', '\.exe$', '\.bat$')) {
+            $hit = $all | Where-Object { $_.Source -match $ext } | Select-Object -First 1
+            if ($hit) { return $hit.Source }
+        }
+        return $all[0].Source
+    } catch { return '' }
+}
+
 # 精确 pin(11.7.0)必须完全一致; 范围(^11 / >=11 <12 / 11)只比主版本, 避免无谓重装
 function Test-PnpmSatisfies([string]$Version, [string]$Wanted) {
     if (-not $Wanted) { return $true }
@@ -458,7 +485,7 @@ function Ensure-Pnpm([string]$NodeExe, [string]$Wanted = '') {
     # 会执行失败(返回空)并被误判成"版本不符"。先把选定 node 的目录前置, 保证探测与运行
     # 用的都是同一个达标 node
     Add-ToolDirsToPath $NodeExe ''
-    $pnpm = (Get-Command pnpm -ErrorAction SilentlyContinue).Source
+    $pnpm = Resolve-PnpmCmd
     $cur = Get-PnpmVersion $pnpm
     if ($pnpm -and (Test-PnpmSatisfies $cur $Wanted)) { return $pnpm }
     $npmCmd = Join-Path (Split-Path $NodeExe) "npm.cmd"
@@ -487,8 +514,8 @@ function Ensure-Pnpm([string]$NodeExe, [string]$Wanted = '') {
     # 2) 退回全局安装(会替换机器上现有的全局 pnpm)
     if ($pnpm) { Warn "退回全局安装 pnpm@$spec(将替换现有全局 pnpm $cur) ..." }
     else { Warn "退回全局安装 pnpm@$spec ..." }
-    & $npmCmd install -g "pnpm@$spec" --silent | Out-Null
-    $pnpm = (Get-Command pnpm -ErrorAction SilentlyContinue).Source
+    try { & $npmCmd install -g "pnpm@$spec" --silent | Out-Null } catch { Warn "全局安装 pnpm@$spec 失败: $($_.Exception.Message)" }
+    $pnpm = Resolve-PnpmCmd
     if (-not $pnpm) {
         $prefix = (& $npmCmd prefix -g 2>$null | Select-Object -First 1)
         $pc = Join-Path $prefix "pnpm.cmd"
@@ -1483,9 +1510,21 @@ if (-not ($nodeExe0 -and (Test-NodeSatisfies $nodeVer0))) {
 }
 if ($nodeExe0) {
     if ($nodeIsPortable) { Ok "node v$nodeVer0 (便携版, 已解压于 .runtime\nodejs)" } else { Ok "node v$nodeVer0" }
+    if (-not (Test-NodeSatisfies $nodeVer0)) {
+        Warn "node v$nodeVer0 低于门户所需下限 v$NODE_MIN_VERSION(pnpm 11+ 硬要求), 后续会自动改用 .runtime 便携版 $NODE_VERSION"
+    }
 } else { Warn "未检测到 node(仅 dsh 图形门户需要, 后续会自动下载便携版)" }
-$pnpmOk = [bool](Get-Command pnpm -ErrorAction SilentlyContinue)
-if ($pnpmOk) { Ok "pnpm $(pnpm --version 2>$null)" } else { Warn "未检测到 pnpm(仅 dsh 图形门户需要, 后续会用 npm 自动安装)" }
+# 这里绝不能直接写 `pnpm --version`: PATH 上的 pnpm 常是 npm 全局目录里的 .ps1 shim, 它在
+# 当前会话内执行、并用 PATH 里的 node; 机器上 node 太旧时抛 NativeCommandError, EAP=Stop 下
+# 直接终止整个脚本(实测: node v16 + 全局 pnpm 11 -> "This version of pnpm requires at
+# least Node.js v22.13", 体检阶段即退出)。改用带 try/catch 的探测。
+$pnpmCmd0 = Resolve-PnpmCmd
+$pnpmOk = [bool]$pnpmCmd0
+if ($pnpmOk) {
+    $pv0 = Get-PnpmVersion $pnpmCmd0
+    if ($pv0) { Ok "pnpm $pv0" }
+    else { Warn "已安装 pnpm, 但当前 node v$nodeVer0 跑不起来(pnpm 11+ 要求 node >= v$NODE_MIN_VERSION); 门户会改用 .runtime 内隔离安装的 pnpm" }
+} else { Warn "未检测到 pnpm(仅 dsh 图形门户需要, 后续会用 npm 自动安装)" }
 $nodeOk = [bool]$nodeExe0   # 含 .runtime 便携版, 与后面启动门户时的判定一致
 $wingetOk = [bool](Get-Command winget -ErrorAction SilentlyContinue)
 if ($wingetOk) { Ok "winget 可用(自动安装通道就绪)" } else { Warn "未检测到 winget, 缺失组件将无法自动安装" }
